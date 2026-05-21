@@ -91,6 +91,6 @@ class Karaokay < Formula
   end
 
   test do
-    assert_match "Karaoké", shell_output("#{bin}/karaokay --help")
+    assert_match "Karaoke", shell_output("#{bin}/karaokay --help")
   end
 end

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-mpd-karaoke — Affichage synchronisé des paroles pour MPD
-Dépendances : python-mpd2, windows-curses (Windows uniquement)
+mpd-karaoke — Synchronized lyrics display for MPD
+Dependencies: python-mpd2, windows-curses (Windows only)
   pip install python-mpd2
-Optionnel (autofetch des paroles synchronisées) :
+Optional (autofetch of synchronized lyrics):
   pip install syncedlyrics
 """
 
@@ -21,7 +21,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
-# Coupe les logs bruyants des providers de syncedlyrics (ex: Musixmatch 401)
+# Silence noisy logs from syncedlyrics providers (e.g. Musixmatch 401)
 logging.getLogger("syncedlyrics").setLevel(logging.CRITICAL)
 logging.getLogger("root").setLevel(logging.CRITICAL)
 logging.basicConfig(level=logging.CRITICAL)
@@ -29,7 +29,7 @@ logging.basicConfig(level=logging.CRITICAL)
 try:
     from mpd import MPDClient, ConnectionError as MPDConnectionError
 except ImportError:
-    print("Erreur : python-mpd2 requis.  pip install python-mpd2")
+    print("Error: python-mpd2 required.  pip install python-mpd2")
     sys.exit(1)
 
 try:
@@ -43,11 +43,11 @@ except ImportError:
 
 @dataclass
 class LyricLine:
-    time: float      # secondes
+    time: float      # seconds
     text: str
 
 
-# ── Parseur LRC ───────────────────────────────────────────────────────────────
+# ── LRC parser ────────────────────────────────────────────────────────────────
 
 TIME_RE = re.compile(r"\[(\d+):(\d+)\.(\d+)\]")
 
@@ -69,22 +69,22 @@ def parse_lrc(path: str) -> list[LyricLine]:
     return sorted(lines, key=lambda l: l.time)
 
 
-# ── Recherche de fichier LRC ───────────────────────────────────────────────────
+# ── LRC file lookup ───────────────────────────────────────────────────────────
 
 def find_lrc(song: dict, lyrics_dirs: list[str], music_dir: str) -> Optional[str]:
     """
-    Cherche <titre>.lrc dans :
-      1. Le dossier du fichier audio (si music_dir est défini)
-      2. Les dossiers --lyrics-dir passés en argument
+    Looks for <title>.lrc in:
+      1. The audio file's folder (if music_dir is set)
+      2. The --lyrics-dir folders passed as arguments
     """
     candidates: list[str] = []
 
-    # 1. Même dossier que le fichier audio
+    # 1. Same folder as the audio file
     if music_dir and song.get("file"):
         audio_path = Path(music_dir) / song["file"]
         candidates.append(str(audio_path.with_suffix(".lrc")))
 
-    # 2. Dossiers de paroles dédiés
+    # 2. Dedicated lyrics folders
     title  = song.get("title", "")
     artist = song.get("artist", "")
     for d in lyrics_dirs:
@@ -101,7 +101,7 @@ def find_lrc(song: dict, lyrics_dirs: list[str], music_dir: str) -> Optional[str
     return None
 
 
-# ── Connexion MPD avec reconnexion automatique ────────────────────────────────
+# ── MPD connection with automatic reconnection ────────────────────────────────
 
 def make_client(host: str, port: int, password: Optional[str]) -> MPDClient:
     client = MPDClient()
@@ -125,18 +125,18 @@ def safe_currentsong(client: MPDClient) -> dict:
         return {}
 
 
-# ── Formatage du temps ────────────────────────────────────────────────────────
+# ── Time formatting ───────────────────────────────────────────────────────────
 
 def fmt_time(secs: float) -> str:
     secs = max(0, int(secs))
     return f"{secs // 60}:{secs % 60:02d}"
 
 
-# ── Interface curses ──────────────────────────────────────────────────────────
+# ── Curses interface ──────────────────────────────────────────────────────────
 
 class KaraokeUI:
-    # Ratio de lignes affichées avant la ligne active (le reste va après).
-    # 0.33 = la ligne active se positionne à ~1/3 du haut de la zone paroles.
+    # Ratio of lines displayed before the active line (the rest goes after).
+    # 0.33 = the active line sits at ~1/3 from the top of the lyrics area.
     BEFORE_RATIO = 0.33
 
     def __init__(self, stdscr, args):
@@ -159,21 +159,21 @@ class KaraokeUI:
         stdscr.timeout(100)
         self._init_colors()
 
-    # ── Couleurs ─────────────────────────────────────────────────────────────
+    # ── Colors ───────────────────────────────────────────────────────────────
 
     def _init_colors(self):
         curses.start_color()
         curses.use_default_colors()
         # (foreground, background)
-        curses.init_pair(1, curses.COLOR_WHITE,   -1)  # actif
-        curses.init_pair(2, curses.COLOR_CYAN,    -1)  # passé
-        curses.init_pair(3, 8,                    -1)  # futur (gris)
+        curses.init_pair(1, curses.COLOR_WHITE,   -1)  # active
+        curses.init_pair(2, curses.COLOR_CYAN,    -1)  # past
+        curses.init_pair(3, 8,                    -1)  # upcoming (gray)
         curses.init_pair(4, curses.COLOR_GREEN,   -1)  # info
-        curses.init_pair(5, curses.COLOR_YELLOW,  -1)  # avertissement
-        curses.init_pair(6, curses.COLOR_RED,     -1)  # erreur
-        curses.init_pair(7, curses.COLOR_BLUE,    -1)  # barre de progression
+        curses.init_pair(5, curses.COLOR_YELLOW,  -1)  # warning
+        curses.init_pair(6, curses.COLOR_RED,     -1)  # error
+        curses.init_pair(7, curses.COLOR_BLUE,    -1)  # progress bar
 
-    # ── Connexion ─────────────────────────────────────────────────────────────
+    # ── Connection ────────────────────────────────────────────────────────────
 
     def connect(self) -> bool:
         try:
@@ -186,10 +186,10 @@ class KaraokeUI:
         return True
 
     def _detect_music_dir(self) -> str:
-        """Récupère music_directory soit via la commande `config` de MPD
-        (socket UNIX local uniquement), soit en parsant les fichiers de
-        config MPD standards."""
-        # 1. Commande `config` (socket UNIX local + droits admin)
+        """Retrieve music_directory either via MPD's `config` command
+        (local UNIX socket only), or by parsing standard MPD config
+        files."""
+        # 1. `config` command (local UNIX socket + admin rights)
         if self.client:
             try:
                 cfg = self.client.config()
@@ -200,7 +200,7 @@ class KaraokeUI:
             except Exception:
                 pass
 
-        # 2. Parsing des fichiers de config MPD courants
+        # 2. Parsing common MPD config files
         candidates = [
             os.path.expanduser("~/.config/mpd/mpd.conf"),
             os.path.expanduser("~/.mpdconf"),
@@ -220,7 +220,7 @@ class KaraokeUI:
                 continue
         return ""
 
-    # ── Boucle principale ─────────────────────────────────────────────────────
+    # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
         while True:
@@ -232,7 +232,7 @@ class KaraokeUI:
             elif key == ord("-"):
                 self.offset -= 50
             elif key in (ord("s"), ord("S")):
-                # Resync forcée : recharge les paroles
+                # Forced resync: reload lyrics
                 self.last_song = None
             elif key in (ord("p"), ord("P")):
                 self._toggle_pause()
@@ -246,7 +246,7 @@ class KaraokeUI:
 
             if not self.client:
                 if not self.connect():
-                    self._draw_error("MPD inaccessible — nouvelle tentative dans 3 s…")
+                    self._draw_error("MPD unreachable — retrying in 3s…")
                     time.sleep(3)
                     continue
 
@@ -260,7 +260,7 @@ class KaraokeUI:
             self._maybe_reload_lyrics(song)
             self._draw(status, song)
 
-    # ── Contrôle lecture ──────────────────────────────────────────────────────
+    # ── Playback control ──────────────────────────────────────────────────────
 
     def _toggle_pause(self):
         if not self.client:
@@ -276,7 +276,7 @@ class KaraokeUI:
         except Exception:
             self.client = None
 
-    # ── Auto-fetch des paroles ────────────────────────────────────────────────
+    # ── Lyrics auto-fetch ─────────────────────────────────────────────────────
 
     def _start_autofetch(self, song: dict):
         if not SYNCEDLYRICS_AVAILABLE:
@@ -297,7 +297,7 @@ class KaraokeUI:
 
         with self.fetch_lock:
             if song_id in self.fetch_attempted:
-                # garde l'état précédent (not_found / error) pour rester informatif
+                # keep the previous state (not_found / error) to stay informative
                 return
             if self.fetch_thread and self.fetch_thread.is_alive():
                 return
@@ -306,8 +306,8 @@ class KaraokeUI:
 
         safe = lambda s: re.sub(r'[<>:"/\\|?*]', "_", s).strip()
 
-        # 1. Préférence : à côté du fichier audio si on connaît music_dir
-        #    et que le dossier est accessible en écriture.
+        # 1. Preferred: next to the audio file if music_dir is known
+        #    and the folder is writable.
         target_path: Optional[str] = None
         if self.music_dir and song.get("file"):
             audio_path = Path(self.music_dir) / song["file"]
@@ -315,7 +315,7 @@ class KaraokeUI:
             if audio_dir.is_dir() and os.access(audio_dir, os.W_OK):
                 target_path = str(audio_path.with_suffix(".lrc"))
 
-        # 2. Fallback : dossier de paroles dédié.
+        # 2. Fallback: dedicated lyrics folder.
         if target_path is None:
             target_dir = self.args.lyrics_dir[0] if self.args.lyrics_dir else os.path.expanduser("~/.lyrics")
             try:
@@ -350,12 +350,12 @@ class KaraokeUI:
         self.fetch_thread = threading.Thread(target=worker, daemon=True)
         self.fetch_thread.start()
 
-    # ── Rechargement des paroles ──────────────────────────────────────────────
+    # ── Lyrics reload ─────────────────────────────────────────────────────────
 
     def _maybe_reload_lyrics(self, song: dict):
         song_id = song.get("id") or song.get("file")
         if song_id == self.last_song:
-            # Le thread d'autofetch a-t-il déposé un fichier ?
+            # Has the autofetch thread dropped a file?
             with self.fetch_lock:
                 ready = self.fetch_state == "found" and not self.lyrics
                 if ready:
@@ -373,7 +373,7 @@ class KaraokeUI:
             with self.fetch_lock:
                 self.fetch_state = None
 
-    # ── Rendu ─────────────────────────────────────────────────────────────────
+    # ── Rendering ─────────────────────────────────────────────────────────────
 
     def _draw(self, status: dict, song: dict):
         h, w = self.stdscr.getmaxyx()
@@ -381,7 +381,7 @@ class KaraokeUI:
 
         row = 0
 
-        # — Barre de statut ——————————————————————————————————————
+        # — Status bar ——————————————————————————————————————————
         state = status.get("state", "stop")
         state_icon = {"play": "▶", "pause": "⏸", "stop": "■"}.get(state, "?")
         connected  = f"{state_icon} MPD {self.args.host}:{self.args.port}"
@@ -391,30 +391,30 @@ class KaraokeUI:
             with self.fetch_lock:
                 fs = self.fetch_state
             if fs == "fetching":
-                lrc_info = "  LRC: recherche en ligne…"
+                lrc_info = "  LRC: searching online…"
             elif fs == "not_found":
-                lrc_info = "  LRC: aucune version synchronisée trouvée"
+                lrc_info = "  LRC: no synchronized version found"
             elif fs == "error":
-                lrc_info = "  LRC: erreur de fetch"
+                lrc_info = "  LRC: fetch error"
             elif fs == "no_module":
-                lrc_info = "  LRC: module 'syncedlyrics' absent (pip install syncedlyrics)"
+                lrc_info = "  LRC: 'syncedlyrics' module missing (pip install syncedlyrics)"
             elif fs == "disabled":
-                lrc_info = "  LRC: autofetch désactivé (--no-autofetch)"
+                lrc_info = "  LRC: autofetch disabled (--no-autofetch)"
             elif fs == "no_meta":
-                lrc_info = "  LRC: métadonnées insuffisantes (pas de titre)"
+                lrc_info = "  LRC: insufficient metadata (no title)"
             else:
-                lrc_info = "  LRC: introuvable"
+                lrc_info = "  LRC: not found"
         off_str    = f"  offset: {'+' if self.offset >= 0 else ''}{self.offset}ms"
         status_line = connected + lrc_info + off_str
         self._addstr(row, 0, status_line[:w], curses.color_pair(4) | curses.A_BOLD)
         row += 1
 
-        # — Séparateur ——————————————————————————————————————————
+        # — Separator ———————————————————————————————————————————
         self._hline(row, w); row += 1
 
-        # — Titre / Artiste ————————————————————————————————————
+        # — Title / Artist ——————————————————————————————————————
         title  = song.get("title")  or Path(song.get("file", "?")).stem
-        artist = song.get("artist") or "Artiste inconnu"
+        artist = song.get("artist") or "Unknown artist"
         album  = song.get("album",  "")
         self._addstr(row, 0, title[:w],  curses.color_pair(1) | curses.A_BOLD); row += 1
         info = f"{artist}"
@@ -422,7 +422,7 @@ class KaraokeUI:
             info += f" — {album}"
         self._addstr(row, 0, info[:w], curses.color_pair(3)); row += 1
 
-        # — Barre de progression ———————————————————————————————
+        # — Progress bar ————————————————————————————————————————
         row += 1
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
@@ -434,14 +434,14 @@ class KaraokeUI:
         self._addstr(row, 0, prog_line[:w], curses.color_pair(7))
         row += 2
 
-        # — Séparateur ——————————————————————————————————————————
+        # — Separator ———————————————————————————————————————————
         self._hline(row, w); row += 1
 
-        # — Paroles ————————————————————————————————————————————
+        # — Lyrics ——————————————————————————————————————————————
         elapsed_adj = elapsed_raw + self.offset / 1000.0
 
         if not self.lyrics:
-            msg = "Aucune parole (déposez un .lrc à côté du fichier audio)"
+            msg = "No lyrics (drop a .lrc next to the audio file)"
             self._addstr(row, 2, msg[:w-2], curses.color_pair(5))
         else:
             active = -1
@@ -450,10 +450,10 @@ class KaraokeUI:
                     active = i
                     break
 
-            avail = max(1, h - row - 2)  # lignes disponibles (- aide en bas)
+            avail = max(1, h - row - 2)  # available lines (- help at the bottom)
 
-            # Déploie chaque ligne en autant de lignes visuelles que nécessaire
-            # pour gérer le wrap des phrases plus larges que le terminal.
+            # Expand each line into as many visual rows as needed to handle
+            # wrapping for phrases wider than the terminal.
             visual_rows: list[tuple[int, bool, str]] = []
             active_visual_start: Optional[int] = None
             for idx, lyr in enumerate(self.lyrics):
@@ -493,9 +493,9 @@ class KaraokeUI:
                 indent_x = 4 if abs_i == active else 2
                 self._addstr(lrow, indent_x, text[: w - indent_x], attr)
 
-        # — Aide en bas ————————————————————————————————————————
+        # — Help at the bottom —————————————————————————————————
         help_row = h - 1
-        help_str = " q:quitter  p:pause/lecture  +:offset+50ms  -:offset-50ms  s:resync  f:refetch "
+        help_str = " q:quit  p:play/pause  +:offset+50ms  -:offset-50ms  s:resync  f:refetch "
         self._addstr(help_row, 0, help_str[:w], curses.color_pair(3))
 
         self.stdscr.refresh()
@@ -519,29 +519,29 @@ class KaraokeUI:
             pass
 
 
-# ── Point d'entrée ────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser(
-        description="Karaoké CLI synchronisé avec MPD"
+        description="Karaoke CLI synchronized with MPD"
     )
     p.add_argument("--host",       default=os.getenv("MPD_HOST", "localhost"),
-                   help="Hôte MPD (défaut: localhost ou $MPD_HOST)")
+                   help="MPD host (default: localhost or $MPD_HOST)")
     p.add_argument("--port",       type=int, default=int(os.getenv("MPD_PORT", 6600)),
-                   help="Port MPD (défaut: 6600 ou $MPD_PORT)")
+                   help="MPD port (default: 6600 or $MPD_PORT)")
     p.add_argument("--password",   default=os.getenv("MPD_PASSWORD"),
-                   help="Mot de passe MPD")
+                   help="MPD password")
     p.add_argument("--music-dir",  default=os.getenv("MPD_MUSIC_DIR", ""),
-                   help="Répertoire racine de la musique (pour trouver les .lrc côte à côte)")
+                   help="Music root directory (to find .lrc files side-by-side)")
     p.add_argument("--lyrics-dir", action="append", default=[],
-                   help="Dossier(s) contenant les fichiers .lrc (répétable)")
+                   help="Folder(s) containing .lrc files (repeatable)")
     p.add_argument("--offset",     type=int, default=0,
-                   help="Décalage initial en ms (positif = avancer les paroles)")
+                   help="Initial offset in ms (positive = move lyrics ahead)")
     p.add_argument("--no-autofetch", action="store_true",
-                   help="Désactive la récupération automatique des paroles via syncedlyrics")
+                   help="Disable automatic lyrics retrieval via syncedlyrics")
     args = p.parse_args()
 
-    # Dossier par défaut
+    # Default folder
     if not args.lyrics_dir:
         args.lyrics_dir = [os.path.expanduser("~/.lyrics")]
 

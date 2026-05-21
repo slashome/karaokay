@@ -11,6 +11,8 @@
 
 A minimalist curses-based karaoke client that follows whatever MPD is playing and renders timed lyrics (`.lrc`) line by line, with auto-fetch when a track has no local lyrics file.
 
+![karaokay in action](docs/screenshot.png)
+
 ---
 
 ## Features

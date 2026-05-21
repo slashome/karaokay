@@ -15,6 +15,7 @@ import sys
 import socket
 import argparse
 import logging
+import textwrap
 import threading
 from pathlib import Path
 from dataclasses import dataclass
@@ -451,40 +452,46 @@ class KaraokeUI:
 
             avail = max(1, h - row - 2)  # lignes disponibles (- aide en bas)
 
-            before = int(avail * self.BEFORE_RATIO)
-            after  = avail - before - 1  # -1 pour la ligne active elle-même
+            # Déploie chaque ligne en autant de lignes visuelles que nécessaire
+            # pour gérer le wrap des phrases plus larges que le terminal.
+            visual_rows: list[tuple[int, bool, str]] = []
+            active_visual_start: Optional[int] = None
+            for idx, lyr in enumerate(self.lyrics):
+                time_tag = f"[{fmt_time(lyr.time)}] "
+                body_w   = max(1, w - 4 - len(time_tag))
+                pieces   = textwrap.wrap(
+                    lyr.text, width=body_w,
+                    break_long_words=True,
+                    break_on_hyphens=False,
+                ) or [""]
+                if idx == active:
+                    active_visual_start = len(visual_rows)
+                visual_rows.append((idx, True, time_tag + pieces[0]))
+                cont = " " * len(time_tag)
+                for piece in pieces[1:]:
+                    visual_rows.append((idx, False, cont + piece))
 
-            start = max(0, active - before)
-            end   = min(len(self.lyrics), active + after + 1)
+            if active_visual_start is None:
+                active_visual_start = 0
 
-            # Récupère les lignes manquantes d'un côté si l'autre est tronqué
+            target_before = int(avail * self.BEFORE_RATIO)
+            start = max(0, active_visual_start - target_before)
+            end   = min(len(visual_rows), start + avail)
             if end - start < avail:
-                if start == 0:
-                    end = min(len(self.lyrics), start + avail)
-                elif end == len(self.lyrics):
-                    start = max(0, end - avail)
+                start = max(0, end - avail)
 
-            visible = self.lyrics[start:end]
-            for i, line in enumerate(visible):
-                abs_i = start + i
-                lrow  = row + i
+            for i, (abs_i, is_first, text) in enumerate(visual_rows[start:end]):
+                lrow = row + i
                 if lrow >= h - 1:
                     break
-                if abs_i < active:
-                    pair = curses.color_pair(3)          # passé
-                    attr = pair
-                elif abs_i == active:
-                    pair = curses.color_pair(1)          # actif
-                    attr = pair | curses.A_BOLD
-                    # curseur de position
-                    self._addstr(lrow, 0, "▶ ", curses.color_pair(4) | curses.A_BOLD)
+                if abs_i == active:
+                    attr = curses.color_pair(1) | curses.A_BOLD
+                    if is_first:
+                        self._addstr(lrow, 0, "▶ ", curses.color_pair(4) | curses.A_BOLD)
                 else:
-                    pair = curses.color_pair(3)          # futur
-                    attr = pair
-                time_tag = f"[{fmt_time(line.time)}] "
-                text     = line.text
-                full     = time_tag + text
-                self._addstr(lrow, 2 if abs_i != active else 4, full[: w - 4], attr)
+                    attr = curses.color_pair(3)
+                indent_x = 4 if abs_i == active else 2
+                self._addstr(lrow, indent_x, text[: w - indent_x], attr)
 
         # — Aide en bas ————————————————————————————————————————
         help_row = h - 1

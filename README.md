@@ -26,7 +26,18 @@ A minimalist curses-based karaoke client that follows whatever MPD is playing an
 
 ---
 
-## Requirements
+## Install
+
+### Homebrew (macOS / Linux)
+
+```bash
+brew tap slashome/tap
+brew install karaokay
+```
+
+### From source
+
+Requirements:
 
 - Python 3.10+
 - An MPD instance you can reach

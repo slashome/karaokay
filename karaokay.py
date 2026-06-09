@@ -149,6 +149,9 @@ class KaraokeUI:
         self.last_song: Optional[str]  = None
         self.client:   Optional[MPDClient] = None
 
+        self.show_header = True   # status bar (MPD/LRC/offset)
+        self.show_player = True   # now-playing block (title/artist/progress)
+
         self.fetch_lock = threading.Lock()
         self.fetch_state: Optional[str] = None   # "fetching" | "found" | "not_found" | "error"
         self.fetch_attempted: set[str] = set()
@@ -236,6 +239,12 @@ class KaraokeUI:
                 self.last_song = None
             elif key in (ord("p"), ord("P")):
                 self._toggle_pause()
+            elif key in (ord("h"), ord("H")):
+                self.show_header = not self.show_header
+                self.stdscr.clear()
+            elif key in (ord("i"), ord("I")):
+                self.show_player = not self.show_player
+                self.stdscr.clear()
             elif key in (ord("f"), ord("F")):
                 with self.fetch_lock:
                     self.fetch_attempted.clear()
@@ -381,61 +390,63 @@ class KaraokeUI:
 
         row = 0
 
-        # — Status bar ——————————————————————————————————————————
-        state = status.get("state", "stop")
-        state_icon = {"play": "▶", "pause": "⏸", "stop": "■"}.get(state, "?")
-        connected  = f"{state_icon} MPD {self.args.host}:{self.args.port}"
-        if self.lrc_path:
-            lrc_info = f"  LRC: {os.path.basename(self.lrc_path)}"
-        else:
-            with self.fetch_lock:
-                fs = self.fetch_state
-            if fs == "fetching":
-                lrc_info = "  LRC: searching online…"
-            elif fs == "not_found":
-                lrc_info = "  LRC: no synchronized version found"
-            elif fs == "error":
-                lrc_info = "  LRC: fetch error"
-            elif fs == "no_module":
-                lrc_info = "  LRC: 'syncedlyrics' module missing (pip install syncedlyrics)"
-            elif fs == "disabled":
-                lrc_info = "  LRC: autofetch disabled (--no-autofetch)"
-            elif fs == "no_meta":
-                lrc_info = "  LRC: insufficient metadata (no title)"
-            else:
-                lrc_info = "  LRC: not found"
-        off_str    = f"  offset: {'+' if self.offset >= 0 else ''}{self.offset}ms"
-        status_line = connected + lrc_info + off_str
-        self._addstr(row, 0, status_line[:w], curses.color_pair(4) | curses.A_BOLD)
-        row += 1
-
-        # — Separator ———————————————————————————————————————————
-        self._hline(row, w); row += 1
-
-        # — Title / Artist ——————————————————————————————————————
-        title  = song.get("title")  or Path(song.get("file", "?")).stem
-        artist = song.get("artist") or "Unknown artist"
-        album  = song.get("album",  "")
-        self._addstr(row, 0, title[:w],  curses.color_pair(1) | curses.A_BOLD); row += 1
-        info = f"{artist}"
-        if album:
-            info += f" — {album}"
-        self._addstr(row, 0, info[:w], curses.color_pair(3)); row += 1
-
-        # — Progress bar ————————————————————————————————————————
-        row += 1
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
-        pct         = min(1.0, elapsed_raw / duration)
-        bar_w       = w - 18
-        filled      = int(bar_w * pct)
-        bar = "█" * filled + "░" * (bar_w - filled)
-        prog_line   = f" {fmt_time(elapsed_raw)} [{bar}] {fmt_time(duration)}"
-        self._addstr(row, 0, prog_line[:w], curses.color_pair(7))
-        row += 2
 
-        # — Separator ———————————————————————————————————————————
-        self._hline(row, w); row += 1
+        # — Status bar ——————————————————————————————————————————
+        if self.show_header:
+            state = status.get("state", "stop")
+            state_icon = {"play": "▶", "pause": "⏸", "stop": "■"}.get(state, "?")
+            connected  = f"{state_icon} MPD {self.args.host}:{self.args.port}"
+            if self.lrc_path:
+                lrc_info = f"  LRC: {os.path.basename(self.lrc_path)}"
+            else:
+                with self.fetch_lock:
+                    fs = self.fetch_state
+                if fs == "fetching":
+                    lrc_info = "  LRC: searching online…"
+                elif fs == "not_found":
+                    lrc_info = "  LRC: no synchronized version found"
+                elif fs == "error":
+                    lrc_info = "  LRC: fetch error"
+                elif fs == "no_module":
+                    lrc_info = "  LRC: 'syncedlyrics' module missing (pip install syncedlyrics)"
+                elif fs == "disabled":
+                    lrc_info = "  LRC: autofetch disabled (--no-autofetch)"
+                elif fs == "no_meta":
+                    lrc_info = "  LRC: insufficient metadata (no title)"
+                else:
+                    lrc_info = "  LRC: not found"
+            off_str    = f"  offset: {'+' if self.offset >= 0 else ''}{self.offset}ms"
+            status_line = connected + lrc_info + off_str
+            self._addstr(row, 0, status_line[:w], curses.color_pair(4) | curses.A_BOLD)
+            row += 1
+
+            # — Separator ———————————————————————————————————————————
+            self._hline(row, w); row += 1
+
+        # — Player: Title / Artist / Progress bar ————————————————
+        if self.show_player:
+            title  = song.get("title")  or Path(song.get("file", "?")).stem
+            artist = song.get("artist") or "Unknown artist"
+            album  = song.get("album",  "")
+            self._addstr(row, 0, title[:w],  curses.color_pair(1) | curses.A_BOLD); row += 1
+            info = f"{artist}"
+            if album:
+                info += f" — {album}"
+            self._addstr(row, 0, info[:w], curses.color_pair(3)); row += 1
+
+            row += 1
+            pct         = min(1.0, elapsed_raw / duration)
+            bar_w       = w - 18
+            filled      = int(bar_w * pct)
+            bar = "█" * filled + "░" * (bar_w - filled)
+            prog_line   = f" {fmt_time(elapsed_raw)} [{bar}] {fmt_time(duration)}"
+            self._addstr(row, 0, prog_line[:w], curses.color_pair(7))
+            row += 2
+
+            # — Separator ———————————————————————————————————————————
+            self._hline(row, w); row += 1
 
         # — Lyrics ——————————————————————————————————————————————
         elapsed_adj = elapsed_raw + self.offset / 1000.0
@@ -495,7 +506,7 @@ class KaraokeUI:
 
         # — Help at the bottom —————————————————————————————————
         help_row = h - 1
-        help_str = " q:quit  p:play/pause  +:offset+50ms  -:offset-50ms  s:resync  f:refetch "
+        help_str = " q:quit  p:play/pause  +/-:offset  s:resync  f:refetch  h:header  i:player "
         self._addstr(help_row, 0, help_str[:w], curses.color_pair(3))
 
         self.stdscr.refresh()

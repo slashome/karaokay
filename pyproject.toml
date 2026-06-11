@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "karaokay"
-version = "0.2.0"
+version = "0.3.0"
 description = "Synchronized lyrics in your terminal, powered by MPD"
 readme = "README.md"
 license = { text = "MIT" }
@@ -21,6 +21,9 @@ dependencies = [
     "python-mpd2>=3.0",
     "syncedlyrics>=0.7",
 ]
+
+[project.optional-dependencies]
+cover = ["pillow>=9"]
 
 [project.scripts]
 karaokay = "karaokay:main"

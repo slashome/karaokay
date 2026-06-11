@@ -5,6 +5,8 @@ Dependencies: python-mpd2, windows-curses (Windows only)
   pip install python-mpd2
 Optional (autofetch of synchronized lyrics):
   pip install syncedlyrics
+Optional (album cover display, incl. WebP/JPEG decoding):
+  pip install pillow
 """
 
 import curses
@@ -12,6 +14,8 @@ import time
 import re
 import os
 import sys
+import io
+import base64
 import socket
 import argparse
 import logging
@@ -37,6 +41,12 @@ try:
     SYNCEDLYRICS_AVAILABLE = True
 except ImportError:
     SYNCEDLYRICS_AVAILABLE = False
+
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 
 # ── Structures ────────────────────────────────────────────────────────────────
@@ -101,6 +111,38 @@ def find_lrc(song: dict, lyrics_dirs: list[str], music_dir: str) -> Optional[str
     return None
 
 
+# ── Album cover lookup ────────────────────────────────────────────────────────
+
+COVER_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def find_cover(song: dict, music_dir: str) -> Optional[str]:
+    """
+    Looks for cover.{png,jpg,jpeg,webp} in the album folder, i.e. the
+    directory that holds the currently playing audio file.
+    """
+    if not (music_dir and song.get("file")):
+        return None
+    album_dir = (Path(music_dir) / song["file"]).parent
+
+    # Fast path: conventional lower-case names.
+    for ext in COVER_EXTS:
+        p = album_dir / f"cover{ext}"
+        if p.is_file():
+            return str(p)
+
+    # Case-insensitive fallback (e.g. Cover.JPG).
+    try:
+        for entry in album_dir.iterdir():
+            if (entry.is_file()
+                    and entry.stem.lower() == "cover"
+                    and entry.suffix.lower() in COVER_EXTS):
+                return str(entry)
+    except OSError:
+        pass
+    return None
+
+
 # ── MPD connection with automatic reconnection ────────────────────────────────
 
 def make_client(host: str, port: int, password: Optional[str]) -> MPDClient:
@@ -132,6 +174,199 @@ def fmt_time(secs: float) -> str:
     return f"{secs // 60}:{secs % 60:02d}"
 
 
+# ── Album cover rendering ─────────────────────────────────────────────────────
+#
+# curses cannot draw images, so the cover is emitted with raw terminal escape
+# sequences in a rectangle that curses is told to leave untouched. A best-effort
+# cascade picks the nicest backend the terminal supports:
+#
+#   kitty   — Kitty graphics protocol (Kitty, Ghostty, WezTerm). Overlay image,
+#             transmitted once per track.
+#   iterm2  — iTerm2 inline images (iTerm2, WezTerm). Cell-anchored, drawn once
+#             per track and kept alive by curses' blank-cell persistence.
+#   blocks  — truecolor half-block glyphs (▀). Works in any 24-bit terminal;
+#             repainted every frame so it survives curses redraws.
+#   blocks256 — same half-block trick quantized to the xterm-256 palette, for
+#             terminals without 24-bit color (e.g. Apple Terminal).
+#
+# All backends require Pillow (decoding + resizing, mandatory for WebP/JPEG).
+
+def detect_cover_backend(override: str) -> Optional[str]:
+    if override and override != "auto":
+        return None if override == "none" else override
+
+    term      = os.environ.get("TERM", "")
+    term_prog = os.environ.get("TERM_PROGRAM", "")
+
+    if (os.environ.get("KITTY_WINDOW_ID")
+            or "kitty" in term or "ghostty" in term
+            or term_prog == "ghostty"):
+        return "kitty"
+    if (term_prog in ("iTerm.app", "WezTerm")
+            or os.environ.get("LC_TERMINAL") == "iTerm2"):
+        return "iterm2"
+    # Half-blocks: truecolor when advertised, otherwise the 256-color palette.
+    if os.environ.get("COLORTERM") in ("truecolor", "24bit"):
+        return "blocks"
+    return "blocks256"
+
+
+class CoverRenderer:
+    KITTY_CHUNK = 4096   # base64 chars per kitty transmission chunk
+
+    def __init__(self, override: str = "auto"):
+        self.backend  = detect_cover_backend(override)
+        self._sig      = None   # (path, x, y, cols, rows) currently displayed
+        self._shown    = False
+        self._blocks   = None   # cached escape string for the blocks backend
+
+    def available(self) -> bool:
+        return self.backend is not None and PIL_AVAILABLE
+
+    # ── Low-level terminal I/O ──────────────────────────────────────────────
+
+    @staticmethod
+    def _emit(s: str):
+        try:
+            sys.stdout.write(s)
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    @staticmethod
+    def _cup(x: int, y: int) -> str:
+        # Absolute cursor positioning (1-based), x = column, y = row.
+        return f"\x1b[{y + 1};{x + 1}H"
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def show(self, path: str, x: int, y: int, cols: int, rows: int,
+             force: bool = False):
+        """Display `path` at cell (x, y) spanning cols×rows. Must be called
+        AFTER curses' refresh() so the escapes land on a settled screen."""
+        if not self.available():
+            return
+        sig     = (path, x, y, cols, rows)
+        changed = force or sig != self._sig
+        try:
+            if self.backend in ("blocks", "blocks256"):
+                if changed or self._blocks is None:
+                    self._blocks = self._render_blocks(path, x, y, cols, rows)
+                    self._sig    = sig
+                if self._blocks:
+                    self._emit(self._blocks)   # repaint every frame
+                    self._shown = True
+            elif self.backend == "kitty":
+                if changed:
+                    self._clear_kitty()
+                    self._emit_kitty(path, x, y, cols, rows)
+                    self._sig, self._shown = sig, True
+            elif self.backend == "iterm2":
+                if changed:
+                    self._emit_iterm2(path, x, y, cols, rows)
+                    self._sig, self._shown = sig, True
+        except Exception:
+            # A broken/unreadable image must never crash the UI.
+            self._sig = sig   # don't retry this geometry every frame
+            self._blocks = ""
+
+    def hide(self):
+        """Physically erase whatever cover is on screen (idempotent)."""
+        if not self._shown:
+            return
+        if self._sig:
+            _, x, y, cols, rows = self._sig
+            if self.backend == "kitty":
+                self._clear_kitty()
+            else:
+                self._clear_region(x, y, cols, rows)
+        self._shown = False
+        self._sig    = None
+        self._blocks = None
+
+    def invalidate(self):
+        """Force a full redraw on the next show() (after resize / toggle)."""
+        self._sig    = None
+        self._blocks = None
+
+    # ── Backends ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _rgb_to_256(r: int, g: int, b: int) -> int:
+        # Map an RGB triple onto the xterm-256 palette: the 6×6×6 color cube
+        # (16–231) or the grayscale ramp (232–255).
+        if r == g == b:
+            if r < 8:
+                return 16
+            if r > 248:
+                return 231
+            return 232 + (r - 8) * 24 // 247
+        ri = r * 5 // 255
+        gi = g * 5 // 255
+        bi = b * 5 // 255
+        return 16 + 36 * ri + 6 * gi + bi
+
+    def _render_blocks(self, path: str, x: int, y: int,
+                       cols: int, rows: int) -> str:
+        # One character cell shows two vertical pixels via the upper half block:
+        # foreground = top pixel, background = bottom pixel.
+        img    = Image.open(path).convert("RGB").resize((cols, rows * 2))
+        px     = img.load()
+        is_256 = self.backend == "blocks256"
+        out    = []
+        for r in range(rows):
+            line = [self._cup(x, y + r)]
+            for c in range(cols):
+                top = px[c, r * 2]
+                bot = px[c, r * 2 + 1]
+                if is_256:
+                    line.append(
+                        f"\x1b[38;5;{self._rgb_to_256(*top)}m"
+                        f"\x1b[48;5;{self._rgb_to_256(*bot)}m▀")
+                else:
+                    line.append(
+                        f"\x1b[38;2;{top[0]};{top[1]};{top[2]};"
+                        f"48;2;{bot[0]};{bot[1]};{bot[2]}m▀")
+            line.append("\x1b[0m")
+            out.append("".join(line))
+        return "".join(out)
+
+    def _png_bytes(self, path: str) -> bytes:
+        img = Image.open(path).convert("RGBA")
+        img.thumbnail((512, 512))   # cap payload size
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    def _emit_kitty(self, path: str, x: int, y: int, cols: int, rows: int):
+        b64 = base64.b64encode(self._png_bytes(path)).decode("ascii")
+        self._emit(self._cup(x, y))
+        chunks = [b64[i:i + self.KITTY_CHUNK]
+                  for i in range(0, len(b64), self.KITTY_CHUNK)] or [""]
+        for i, chunk in enumerate(chunks):
+            last = i == len(chunks) - 1
+            if i == 0:
+                ctrl = f"a=T,f=100,c={cols},r={rows},m={0 if last else 1}"
+            else:
+                ctrl = f"m={0 if last else 1}"
+            self._emit(f"\x1b_G{ctrl};{chunk}\x1b\\")
+
+    def _clear_kitty(self):
+        self._emit("\x1b_Ga=d\x1b\\")   # delete all images
+
+    def _emit_iterm2(self, path: str, x: int, y: int, cols: int, rows: int):
+        b64 = base64.b64encode(self._png_bytes(path)).decode("ascii")
+        self._emit(self._cup(x, y))
+        self._emit(
+            f"\x1b]1337;File=inline=1;width={cols};height={rows};"
+            f"preserveAspectRatio=1:{b64}\x07")
+
+    def _clear_region(self, x: int, y: int, cols: int, rows: int):
+        blank = " " * cols
+        for r in range(rows):
+            self._emit(f"{self._cup(x, y + r)}\x1b[0m{blank}")
+
+
 # ── Curses interface ──────────────────────────────────────────────────────────
 
 class KaraokeUI:
@@ -151,6 +386,11 @@ class KaraokeUI:
 
         self.show_header = True   # status bar (MPD/LRC/offset)
         self.show_player = True   # now-playing block (title/artist/progress)
+        self.show_cover  = not getattr(args, "no_cover", False)  # album art
+
+        self.cover       = CoverRenderer(getattr(args, "cover_protocol", "auto"))
+        self.cover_path: Optional[str] = None
+        self._cover_dirty = False   # force a cover redraw on next frame
 
         self.fetch_lock = threading.Lock()
         self.fetch_state: Optional[str] = None   # "fetching" | "found" | "not_found" | "error"
@@ -242,9 +482,15 @@ class KaraokeUI:
             elif key in (ord("h"), ord("H")):
                 self.show_header = not self.show_header
                 self.stdscr.clear()
+                self._reset_cover()
             elif key in (ord("i"), ord("I")):
                 self.show_player = not self.show_player
                 self.stdscr.clear()
+                self._reset_cover()
+            elif key in (ord("c"), ord("C")):
+                self.show_cover = not self.show_cover
+                self.stdscr.clear()
+                self._reset_cover()
             elif key in (ord("f"), ord("F")):
                 with self.fetch_lock:
                     self.fetch_attempted.clear()
@@ -252,6 +498,7 @@ class KaraokeUI:
                 self.last_song = None
             elif key == curses.KEY_RESIZE:
                 self.stdscr.clear()
+                self._reset_cover()
 
             if not self.client:
                 if not self.connect():
@@ -268,6 +515,12 @@ class KaraokeUI:
 
             self._maybe_reload_lyrics(song)
             self._draw(status, song)
+
+    def _reset_cover(self):
+        """After a full screen clear (resize/toggle) the cover must be wiped
+        and redrawn from scratch on the next frame."""
+        self.cover.hide()
+        self._cover_dirty = True
 
     # ── Playback control ──────────────────────────────────────────────────────
 
@@ -376,6 +629,8 @@ class KaraokeUI:
         self.last_song = song_id
         self.lrc_path  = find_lrc(song, self.args.lyrics_dir, self.music_dir)
         self.lyrics    = parse_lrc(self.lrc_path) if self.lrc_path else []
+        self.cover_path = find_cover(song, self.music_dir)
+        self._cover_dirty = True
         if not self.lrc_path:
             self._start_autofetch(song)
         else:
@@ -392,6 +647,20 @@ class KaraokeUI:
 
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
+
+        # — Album cover geometry ————————————————————————————————
+        # The cover sits to the LEFT of the now-playing block, so the top
+        # block (header + player) is shifted right by `left` columns.
+        cover_on = (self.show_cover and self.show_player
+                    and self.cover.available() and bool(self.cover_path))
+        cover_rows = cover_cols = 0
+        if cover_on:
+            cover_rows = min(8, max(4, h // 3))
+            cover_cols = cover_rows * 2          # square (cells are ~1:2)
+            if w < cover_cols + 24 or h < cover_rows + 4:
+                cover_on = False
+                cover_rows = cover_cols = 0
+        left = cover_cols + 2 if cover_on else 0
 
         # — Status bar ——————————————————————————————————————————
         if self.show_header:
@@ -419,33 +688,35 @@ class KaraokeUI:
                     lrc_info = "  LRC: not found"
             off_str    = f"  offset: {'+' if self.offset >= 0 else ''}{self.offset}ms"
             status_line = connected + lrc_info + off_str
-            self._addstr(row, 0, status_line[:w], curses.color_pair(4) | curses.A_BOLD)
+            self._addstr(row, left, status_line[:w - left], curses.color_pair(4) | curses.A_BOLD)
             row += 1
 
             # — Separator ———————————————————————————————————————————
-            self._hline(row, w); row += 1
+            self._hline(row, w, left); row += 1
 
         # — Player: Title / Artist / Progress bar ————————————————
         if self.show_player:
+            avail_w = w - left
             title  = song.get("title")  or Path(song.get("file", "?")).stem
             artist = song.get("artist") or "Unknown artist"
             album  = song.get("album",  "")
-            self._addstr(row, 0, title[:w],  curses.color_pair(1) | curses.A_BOLD); row += 1
+            self._addstr(row, left, title[:avail_w],  curses.color_pair(1) | curses.A_BOLD); row += 1
             info = f"{artist}"
             if album:
                 info += f" — {album}"
-            self._addstr(row, 0, info[:w], curses.color_pair(3)); row += 1
+            self._addstr(row, left, info[:avail_w], curses.color_pair(3)); row += 1
 
             row += 1
             pct         = min(1.0, elapsed_raw / duration)
-            bar_w       = w - 18
+            bar_w       = max(1, avail_w - 18)
             filled      = int(bar_w * pct)
             bar = "█" * filled + "░" * (bar_w - filled)
             prog_line   = f" {fmt_time(elapsed_raw)} [{bar}] {fmt_time(duration)}"
-            self._addstr(row, 0, prog_line[:w], curses.color_pair(7))
-            row += 2
+            self._addstr(row, left, prog_line[:avail_w], curses.color_pair(7))
+            row += 1
 
-            # — Separator ———————————————————————————————————————————
+            # — Separator (full width, below the cover if any) ——————————
+            row = max(row, cover_rows)
             self._hline(row, w); row += 1
 
         # — Lyrics ——————————————————————————————————————————————
@@ -506,10 +777,18 @@ class KaraokeUI:
 
         # — Help at the bottom —————————————————————————————————
         help_row = h - 1
-        help_str = " q:quit  p:play/pause  +/-:offset  s:resync  f:refetch  h:header  i:player "
+        help_str = " q:quit  p:play/pause  +/-:offset  s:resync  f:refetch  h:header  i:player  c:cover "
         self._addstr(help_row, 0, help_str[:w], curses.color_pair(3))
 
         self.stdscr.refresh()
+
+        # — Album cover (raw escapes, on top of the settled screen) ————————
+        if cover_on:
+            self.cover.show(self.cover_path, 0, 0, cover_cols, cover_rows,
+                            force=self._cover_dirty)
+            self._cover_dirty = False
+        else:
+            self.cover.hide()
 
     def _draw_error(self, msg: str):
         h, w = self.stdscr.getmaxyx()
@@ -523,9 +802,9 @@ class KaraokeUI:
         except curses.error:
             pass
 
-    def _hline(self, y, w):
+    def _hline(self, y, w, x0=0):
         try:
-            self.stdscr.addstr(y, 0, "─" * w)
+            self.stdscr.addstr(y, x0, "─" * max(0, w - x0))
         except curses.error:
             pass
 
@@ -550,6 +829,11 @@ def main():
                    help="Initial offset in ms (positive = move lyrics ahead)")
     p.add_argument("--no-autofetch", action="store_true",
                    help="Disable automatic lyrics retrieval via syncedlyrics")
+    p.add_argument("--no-cover", action="store_true",
+                   help="Disable album cover display (requires pillow)")
+    p.add_argument("--cover-protocol", default="auto",
+                   choices=["auto", "kitty", "iterm2", "blocks", "blocks256", "none"],
+                   help="Cover rendering backend (default: auto-detect)")
     args = p.parse_args()
 
     # Default folder

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "karaokay"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Synchronized lyrics in your terminal, powered by MPD"
 readme = "README.md"
 license = { text = "MIT" }
@@ -34,3 +34,6 @@ Issues = "https://github.com/slashome/karaokay/issues"
 
 [tool.setuptools]
 py-modules = ["karaokay"]
+
+[tool.setuptools.dynamic]
+version = { attr = "karaokay.__version__" }

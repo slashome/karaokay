@@ -25,6 +25,21 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
+__version__ = "0.3.2"
+
+# ASCII masthead shown at the top of --help (mirrors the README banner).
+BANNER = """
+  ▄█   ▄█▄    ▄████████    ▄████████    ▄████████  ▄██████▄     ▄█   ▄█▄    ▄████████ ▄██   ▄   
+  ███ ▄███▀   ███    ███   ███    ███   ███    ███ ███    ███   ███ ▄███▀   ███    ███ ███   ██▄ 
+  ███▐██▀     ███    ███   ███    ███   ███    ███ ███    ███   ███▐██▀     ███    ███ ███▄▄▄███ 
+ ▄█████▀      ███    ███  ▄███▄▄▄▄██▀   ███    ███ ███    ███  ▄█████▀      ███    ███ ▀▀▀▀▀▀███ 
+▀▀█████▄    ▀███████████ ▀▀███▀▀▀▀▀   ▀███████████ ███    ███ ▀▀█████▄    ▀███████████ ▄██   ███ 
+  ███▐██▄     ███    ███ ▀███████████   ███    ███ ███    ███   ███▐██▄     ███    ███ ███   ███ 
+  ███ ▀███▄   ███    ███   ███    ███   ███    ███ ███    ███   ███ ▀███▄   ███    ███ ███   ███ 
+  ███   ▀█▀   ███    █▀    ███    ███   ███    █▀   ▀██████▀    ███   ▀█▀   ███    █▀   ▀█████▀  
+  ▀                        ███    ███                           ▀                                
+"""
+
 # Silence noisy logs from syncedlyrics providers (e.g. Musixmatch 401)
 logging.getLogger("syncedlyrics").setLevel(logging.CRITICAL)
 logging.getLogger("root").setLevel(logging.CRITICAL)
@@ -873,8 +888,12 @@ class KaraokeUI:
 
 def main():
     p = argparse.ArgumentParser(
-        description="Karaoke CLI synchronized with MPD"
+        prog="karaokay",
+        description=f"{BANNER}\nKaraoke CLI synchronized with MPD",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version",
+                   version=f"%(prog)s {__version__}")
     p.add_argument("--host",       default=os.getenv("MPD_HOST", "localhost"),
                    help="MPD host (default: localhost or $MPD_HOST)")
     p.add_argument("--port",       type=int, default=int(os.getenv("MPD_PORT", 6600)),

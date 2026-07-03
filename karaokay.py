@@ -400,6 +400,11 @@ class KaraokeUI:
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(100)
+        # Mouse: click a lyric line (or the progress bar) to seek playback.
+        curses.mousemask(curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)
+        # Rebuilt every frame so a click can be mapped back to a seek target:
+        self._lyric_rows: dict[int, float] = {}          # screen row → lyric time (s)
+        self._prog_bar: Optional[tuple] = None           # (row, x0, width, duration)
         self._init_colors()
 
     # ── Colors ───────────────────────────────────────────────────────────────
@@ -407,10 +412,25 @@ class KaraokeUI:
     def _init_colors(self):
         curses.start_color()
         curses.use_default_colors()
+        # Lyrics use a monochrome, faintly warm (beige) white gradient rather
+        # than hues. When the terminal can redefine palette entries we set exact
+        # warm-white RGB triples (r,g,b on a 0..1000 scale; G≈0.95·R, B≈0.80·R
+        # gives the beige tint while keeping luminosity ≈ R). Otherwise we fall
+        # back to the neutral xterm grayscale ramp, then the base palette.
+        LYRIC_ACTIVE, LYRIC_PAST, LYRIC_UPCOMING = 16, 17, 18  # custom RGB slots
+        if curses.can_change_color() and curses.COLORS > LYRIC_UPCOMING:
+            curses.init_color(LYRIC_ACTIVE,   1000, 950, 800)  # current  — warm white
+            curses.init_color(LYRIC_PAST,      933, 886, 746)  # sung     — near-white beige
+            curses.init_color(LYRIC_UPCOMING,  737, 700, 590)  # upcoming — light warm gray
+            active_fg, past_fg, upcoming_fg = LYRIC_ACTIVE, LYRIC_PAST, LYRIC_UPCOMING
+        elif curses.COLORS >= 256:
+            active_fg, past_fg, upcoming_fg = 231, 255, 250  # neutral grayscale fallback
+        else:
+            active_fg, past_fg, upcoming_fg = curses.COLOR_WHITE, curses.COLOR_WHITE, 7
         # (foreground, background)
-        curses.init_pair(1, curses.COLOR_WHITE,   -1)  # active
-        curses.init_pair(2, curses.COLOR_CYAN,    -1)  # past
-        curses.init_pair(3, 8,                    -1)  # upcoming (gray)
+        curses.init_pair(1, active_fg,            -1)  # active   — brightest, pure white
+        curses.init_pair(2, past_fg,              -1)  # past     — already sung, near-white
+        curses.init_pair(3, upcoming_fg,          -1)  # upcoming — light gray
         curses.init_pair(4, curses.COLOR_GREEN,   -1)  # info
         curses.init_pair(5, curses.COLOR_YELLOW,  -1)  # warning
         curses.init_pair(6, curses.COLOR_RED,     -1)  # error
@@ -496,6 +516,8 @@ class KaraokeUI:
                     self.fetch_attempted.clear()
                     self.fetch_state = None
                 self.last_song = None
+            elif key == curses.KEY_MOUSE:
+                self._handle_mouse()
             elif key == curses.KEY_RESIZE:
                 self.stdscr.clear()
                 self._reset_cover()
@@ -535,6 +557,34 @@ class KaraokeUI:
                 self.client.pause(0)
             else:
                 self.client.play()
+        except Exception:
+            self.client = None
+
+    def _handle_mouse(self):
+        try:
+            _id, mx, my, _z, bstate = curses.getmouse()
+        except curses.error:
+            return
+        if not (bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)):
+            return
+        # Progress bar → seek to the clicked fraction of the track.
+        if self._prog_bar:
+            brow, x0, width, dur = self._prog_bar
+            if my == brow and x0 <= mx < x0 + width and dur > 0:
+                frac = (mx - x0 + 0.5) / width
+                self._seek_to_time(max(0.0, min(1.0, frac)) * dur)
+                return
+        # Lyric line → seek so that line becomes the current one. Undo the
+        # display offset, since the active line is picked on elapsed + offset.
+        t = self._lyric_rows.get(my)
+        if t is not None:
+            self._seek_to_time(max(0.0, t - self.offset / 1000.0))
+
+    def _seek_to_time(self, seconds: float):
+        if not self.client:
+            return
+        try:
+            self.client.seekcur(seconds)
         except Exception:
             self.client = None
 
@@ -644,6 +694,9 @@ class KaraokeUI:
         self.stdscr.erase()
 
         row = 0
+        # Rebuilt this frame; consumed by _handle_mouse on the next click.
+        self._lyric_rows = {}
+        self._prog_bar = None
 
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
@@ -707,12 +760,16 @@ class KaraokeUI:
             self._addstr(row, left, info[:avail_w], curses.color_pair(3)); row += 1
 
             row += 1
+            elapsed_str = fmt_time(elapsed_raw)
             pct         = min(1.0, elapsed_raw / duration)
             bar_w       = max(1, avail_w - 18)
             filled      = int(bar_w * pct)
             bar = "█" * filled + "░" * (bar_w - filled)
-            prog_line   = f" {fmt_time(elapsed_raw)} [{bar}] {fmt_time(duration)}"
+            prog_line   = f" {elapsed_str} [{bar}] {fmt_time(duration)}"
             self._addstr(row, left, prog_line[:avail_w], curses.color_pair(7))
+            # Remember the bar's on-screen span so a click can seek into it.
+            # prog_line = " <elapsed> [<bar>] …" → bar starts len(elapsed)+3 in.
+            self._prog_bar = (row, left + len(elapsed_str) + 3, bar_w, duration)
             row += 1
 
             # — Separator (full width, below the cover if any) ——————————
@@ -766,12 +823,15 @@ class KaraokeUI:
                 lrow = row + i
                 if lrow >= h - 1:
                     break
+                self._lyric_rows[lrow] = self.lyrics[abs_i].time
                 if abs_i == active:
                     attr = curses.color_pair(1) | curses.A_BOLD
                     if is_first:
                         self._addstr(lrow, 0, "▶ ", curses.color_pair(4) | curses.A_BOLD)
+                elif abs_i < active:
+                    attr = curses.color_pair(2)  # already sung → cyan
                 else:
-                    attr = curses.color_pair(3)
+                    attr = curses.color_pair(3)  # upcoming → light gray
                 indent_x = 4 if abs_i == active else 2
                 self._addstr(lrow, indent_x, text[: w - indent_x], attr)
 
@@ -840,7 +900,10 @@ def main():
     if not args.lyrics_dir:
         args.lyrics_dir = [os.path.expanduser("~/.lyrics")]
 
-    curses.wrapper(lambda s: KaraokeUI(s, args).run())
+    try:
+        curses.wrapper(lambda s: KaraokeUI(s, args).run())
+    except KeyboardInterrupt:
+        pass  # Ctrl+C: curses.wrapper has already restored the terminal
 
 
 if __name__ == "__main__":

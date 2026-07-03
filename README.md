@@ -14,7 +14,9 @@
 
 A minimalist curses-based karaoke client that follows whatever MPD is playing and renders timed lyrics (`.lrc`) line by line, with auto-fetch when a track has no local lyrics file.
 
-![karaokay in action](docs/screenshot.png)
+![karaokay in action, with album cover, running in Kitty](docs/screenshot.png)
+
+> **Tip:** for the best rendering — crisp album covers via the Kitty graphics protocol and vivid, theme-aware colors — run karaokay in [Kitty](https://sw.kovidgoyal.net/kitty/). Ghostty and WezTerm also support crisp covers; other terminals fall back gracefully (see [Album cover](#album-cover)).
 
 ---
 
@@ -142,7 +144,7 @@ When auto-fetch is enabled and no local file is found, `syncedlyrics` is queried
 ## Notes
 
 - The Musixmatch provider in `syncedlyrics` occasionally returns HTTP 401 — those log lines are silenced by default; other providers (LrcLib, NetEase) keep working transparently.
-- Lyrics rendering is colorized: dim for past/upcoming lines, bold white for the active line, with a `▶` cursor in front.
+- Lyrics rendering is colorized: cyan for already-sung lines, light gray for upcoming ones, and bold white for the active line, with a `▶` cursor in front. Exact hues come from your terminal's ANSI palette, so they follow your theme (Kitty recommended).
 
 ---
 

@@ -114,6 +114,16 @@ pip install windows-curses
 
 ---
 
+## Mouse
+
+| Action | Effect |
+|--------|--------|
+| Click a lyric line | Seek so that line becomes the current one |
+| Click the progress bar | Seek to that point in the track |
+| Click the album cover | Blow it up fullscreen; click anywhere to return |
+
+---
+
 ## Album cover
 
 The cover image must live **in the album folder** (next to the audio files) and be named `cover.png`, `cover.jpg`, `cover.jpeg`, or `cover.webp`. It is shown to the left of the now-playing block.
@@ -126,6 +136,8 @@ Rendering picks the best backend available, degrading gracefully:
 4. **256-color half-blocks** — terminals without truecolor, e.g. Apple Terminal
 
 `pillow` is required (and is what enables WebP/JPEG decoding); if it is missing the cover is silently skipped. Force a specific backend with `--cover-protocol`.
+
+**Click the cover to enlarge it**: it expands to a centered square filling the terminal; click anywhere to restore the normal layout.
 
 ---
 

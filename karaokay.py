@@ -25,7 +25,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
 
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 # ASCII masthead shown at the top of --help (mirrors the README banner).
 BANNER = """
@@ -406,6 +406,7 @@ class KaraokeUI:
         self.cover       = CoverRenderer(getattr(args, "cover_protocol", "auto"))
         self.cover_path: Optional[str] = None
         self._cover_dirty = False   # force a cover redraw on next frame
+        self.cover_fullscreen = False   # cover blown up to fill the terminal
 
         self.fetch_lock = threading.Lock()
         self.fetch_state: Optional[str] = None   # "fetching" | "found" | "not_found" | "error"
@@ -420,6 +421,7 @@ class KaraokeUI:
         # Rebuilt every frame so a click can be mapped back to a seek target:
         self._lyric_rows: dict[int, float] = {}          # screen row → lyric time (s)
         self._prog_bar: Optional[tuple] = None           # (row, x0, width, duration)
+        self._cover_rect: Optional[tuple] = None         # (x, y, cols, rows) on screen
         self._init_colors()
 
     # ── Colors ───────────────────────────────────────────────────────────────
@@ -559,6 +561,13 @@ class KaraokeUI:
         self.cover.hide()
         self._cover_dirty = True
 
+    def _toggle_cover_fullscreen(self):
+        """Switch between the normal layout and the blown-up cover. The layout
+        changes wholesale, so wipe the screen and force a fresh cover redraw."""
+        self.cover_fullscreen = not self.cover_fullscreen
+        self.stdscr.clear()
+        self._reset_cover()
+
     # ── Playback control ──────────────────────────────────────────────────────
 
     def _toggle_pause(self):
@@ -582,6 +591,16 @@ class KaraokeUI:
             return
         if not (bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)):
             return
+        # Fullscreen cover: any click returns to the normal layout.
+        if self.cover_fullscreen:
+            self._toggle_cover_fullscreen()
+            return
+        # Click on the album cover → blow it up to fill the terminal.
+        if self._cover_rect:
+            cx, cy, cw, ch = self._cover_rect
+            if cx <= mx < cx + cw and cy <= my < cy + ch:
+                self._toggle_cover_fullscreen()
+                return
         # Progress bar → seek to the clicked fraction of the track.
         if self._prog_bar:
             brow, x0, width, dur = self._prog_bar
@@ -712,6 +731,17 @@ class KaraokeUI:
         # Rebuilt this frame; consumed by _handle_mouse on the next click.
         self._lyric_rows = {}
         self._prog_bar = None
+        self._cover_rect = None
+
+        # Fullscreen cover takes over the whole screen (click to return).
+        if self.cover_fullscreen:
+            if self.show_cover and self.cover.available() and self.cover_path:
+                self._draw_cover_fullscreen(h, w)
+                return
+            # The track has no usable artwork — drop back to the normal layout.
+            self.cover_fullscreen = False
+            self.stdscr.clear()
+            self.cover.hide()
 
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
@@ -862,8 +892,28 @@ class KaraokeUI:
             self.cover.show(self.cover_path, 0, 0, cover_cols, cover_rows,
                             force=self._cover_dirty)
             self._cover_dirty = False
+            self._cover_rect = (0, 0, cover_cols, cover_rows)  # clickable to zoom
         else:
             self.cover.hide()
+
+    def _draw_cover_fullscreen(self, h: int, w: int):
+        """Render the cover as a large centered square filling the terminal,
+        with a one-line hint at the bottom. A click anywhere returns."""
+        # Square in cells: width ≈ 2×height (cells are roughly 1:2). Leave the
+        # last row for the hint.
+        fs_rows = min(h - 1, max(1, w // 2))
+        fs_cols = fs_rows * 2
+        fs_x    = max(0, (w - fs_cols) // 2)
+        fs_y    = max(0, (h - 1 - fs_rows) // 2)
+
+        hint = "click anywhere to return"
+        self._addstr(h - 1, max(0, (w - len(hint)) // 2), hint[:w], curses.color_pair(3))
+        self.stdscr.refresh()
+
+        self.cover.show(self.cover_path, fs_x, fs_y, fs_cols, fs_rows,
+                        force=self._cover_dirty)
+        self._cover_dirty = False
+        self._cover_rect = (fs_x, fs_y, fs_cols, fs_rows)
 
     def _draw_error(self, msg: str):
         h, w = self.stdscr.getmaxyx()

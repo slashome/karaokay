@@ -21,9 +21,9 @@ jobs:
 
       - name: Sanity gate
         run: |
-          pip install python-mpd2
-          python -m py_compile karaokay.py
-          python karaokay.py --help
+          pip install python-mpd2 requests
+          python -m py_compile karaokay/*.py
+          python -m karaokay --help
 
       - name: Create GitHub release
         env:

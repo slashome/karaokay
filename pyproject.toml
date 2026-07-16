@@ -20,20 +20,21 @@ classifiers = [
 dependencies = [
     "python-mpd2>=3.0",
     "syncedlyrics>=0.7",
+    "requests>=2.25",
 ]
 
 [project.optional-dependencies]
 cover = ["pillow>=9"]
 
 [project.scripts]
-karaokay = "karaokay:main"
+karaokay = "karaokay.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/slashome/karaokay"
 Issues = "https://github.com/slashome/karaokay/issues"
 
 [tool.setuptools]
-py-modules = ["karaokay"]
+packages = ["karaokay"]
 
 [tool.setuptools.dynamic]
 version = { attr = "karaokay.__version__" }

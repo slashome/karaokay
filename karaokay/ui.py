@@ -13,7 +13,7 @@ from .mpd import make_client, safe_status, safe_currentsong, MPDClient
 from .lrc import LyricLine, parse_lrc, find_lrc, resolve_write_path
 from .cover import CoverRenderer, find_cover
 from .fetch import (FetchSession, LyricCandidate, simple_search,
-                    SYNCEDLYRICS_AVAILABLE)
+                    SYNCEDLYRICS_AVAILABLE, REQUESTS_AVAILABLE)
 from .util import fmt_time
 
 
@@ -373,7 +373,9 @@ class KaraokeUI:
     # ── Lyrics auto-fetch (silent, background) ────────────────────────────────
 
     def _start_autofetch(self, song: dict):
-        if not SYNCEDLYRICS_AVAILABLE:
+        # Autofetch works through Lrclib (requests) and/or the syncedlyrics
+        # providers; only bail if neither source is available.
+        if not (REQUESTS_AVAILABLE or SYNCEDLYRICS_AVAILABLE):
             with self.fetch_lock:
                 self.fetch_state = "no_module"
             return
@@ -578,10 +580,28 @@ class KaraokeUI:
 
     # ── Lyrics area ───────────────────────────────────────────────────────────
 
+    def _no_lyrics_msg(self) -> str:
+        """The message shown in the lyrics area when the track has no .lrc.
+
+        Reflects the automatic autofetch state: while it runs, once it fails,
+        and — when it is disabled/unavailable — the plain "press f" hint.
+        """
+        with self.fetch_lock:
+            fs = self.fetch_state
+        if fs == "fetching":
+            return "Searching lyrics online…  (press f to pick one yourself)"
+        if fs == "not_found":
+            return ("Autofetch found no synchronized lyrics — "
+                    "press f to search for them yourself")
+        if fs == "error":
+            return "Autofetch failed — press f to search for lyrics yourself"
+        # disabled / no_module / no_meta / none / cleared: the plain hint.
+        return "No lyrics — press f to fetch, or drop a .lrc next to the audio file"
+
     def _draw_lyrics(self, row: int, h: int, w: int, elapsed_adj: float):
         if not self.lyrics:
-            msg = "No lyrics — press f to fetch, or drop a .lrc next to the audio file"
-            self._addstr(row, 2, msg[:w - 2], curses.color_pair(5))
+            self._addstr(row, 2, self._no_lyrics_msg()[:w - 2],
+                         curses.color_pair(5))
             return
         avail = max(1, h - row - 2)  # available lines (- help at the bottom)
         self._draw_lyric_lines(self.lyrics, row, avail, h, w, elapsed_adj,

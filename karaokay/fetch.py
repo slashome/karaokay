@@ -39,8 +39,42 @@ USER_AGENT        = "karaokay (https://github.com/slashome/karaokay)"
 SYNCED_PROVIDERS  = ["Musixmatch", "NetEase", "Megalobiz", "Genius"]
 
 
+def _lrclib_first_synced(query: str) -> Optional[str]:
+    """First synced LRC returned by Lrclib for `query`, or None.
+
+    Lrclib is the most reliable synced-lyrics source, so the autofetch tries it
+    before falling back to the syncedlyrics providers.
+    """
+    if not REQUESTS_AVAILABLE:
+        return None
+    try:
+        r = requests.get(
+            LRCLIB_ENDPOINT,
+            params={"q": query},
+            headers={"User-Agent": USER_AGENT},
+            timeout=10,
+        )
+        r.raise_for_status()
+        tracks = r.json()
+    except Exception:
+        return None
+    for t in tracks:
+        synced = (t.get("syncedLyrics") or "").strip()
+        if synced:
+            return synced
+    return None
+
+
 def simple_search(query: str) -> Optional[str]:
-    """One best synced-only match, or None. Used by the automatic autofetch."""
+    """First synced LRC found for `query`, or None. Used by the automatic
+    autofetch.
+
+    Tries Lrclib first (same source as the interactive `f` panel, and the most
+    reliable), then falls back to the syncedlyrics providers.
+    """
+    result = _lrclib_first_synced(query)
+    if result:
+        return result
     if not SYNCEDLYRICS_AVAILABLE:
         return None
     return syncedlyrics.search(query, synced_only=True)

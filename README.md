@@ -26,6 +26,7 @@ A minimalist curses-based karaoke client that follows whatever MPD is playing an
 - Auto-detects `music_directory` via MPD `config` command or by parsing standard `mpd.conf` locations
 - Looks for `.lrc` files next to the audio file **and** in user-supplied lyrics directories
 - Optional auto-fetch of synchronized lyrics through [`syncedlyrics`](https://github.com/moehmeni/syncedlyrics)
+- Interactive lyrics picker (`f`): list candidates from several sites (LrcLib, Musixmatch, NetEase, Megalobiz, Genius), preview one against the running track, and save the chosen `.lrc` into the album folder
 - Optional album cover next to the player — uses the best backend your terminal supports (Kitty graphics, iTerm2 inline images, or truecolor half-blocks everywhere else)
 - Reconnects automatically if MPD goes away
 - Clean color-coded UI (past / current / upcoming lines)
@@ -48,12 +49,13 @@ Requirements:
 - Python 3.10+
 - An MPD instance you can reach
 - [`python-mpd2`](https://pypi.org/project/python-mpd2/)
+- [`requests`](https://pypi.org/project/requests/) (used to query LrcLib directly for the `f` picker)
 - *(Optional)* [`syncedlyrics`](https://pypi.org/project/syncedlyrics/) for online lyrics fetch
 - *(Optional)* [`pillow`](https://pypi.org/project/pillow/) for album cover display (required for WebP/JPEG decoding)
 - *(Windows only)* `windows-curses`
 
 ```bash
-pip install python-mpd2 syncedlyrics pillow
+pip install python-mpd2 requests syncedlyrics pillow
 # Windows additionally:
 pip install windows-curses
 ```
@@ -63,23 +65,24 @@ pip install windows-curses
 ## Usage
 
 ```bash
-./karaokay.py [options]
+karaokay [options]           # installed entry point
+python -m karaokay [options] # equivalently, from a source checkout
 ```
 
 ### Common invocations
 
 ```bash
 # Default — connects to localhost:6600, fetches lyrics on demand
-./karaokay.py
+karaokay
 
 # Remote MPD with password
-./karaokay.py --host mpd.lan --port 6600 --password hunter2
+karaokay --host mpd.lan --port 6600 --password hunter2
 
 # Pin a music directory and a dedicated lyrics folder
-./karaokay.py --music-dir ~/Music --lyrics-dir ~/.lyrics
+karaokay --music-dir ~/Music --lyrics-dir ~/.lyrics
 
 # Disable online fetching entirely
-./karaokay.py --no-autofetch
+karaokay --no-autofetch
 ```
 
 ### CLI flags
@@ -107,7 +110,7 @@ pip install windows-curses
 | `+` | Push lyrics 50 ms later |
 | `-` | Pull lyrics 50 ms earlier |
 | `s` | Resync — reload the `.lrc` for the current track |
-| `f` | Force re-fetch lyrics for the current track |
+| `f` | Open the lyrics picker (fetch candidates from several sites) |
 | `h` | Toggle the status header |
 | `i` | Toggle the now-playing block |
 | `c` | Toggle the album cover |
@@ -141,6 +144,36 @@ Rendering picks the best backend available, degrading gracefully:
 
 ---
 
+## Picking better lyrics (`f`)
+
+Auto-fetch grabs whatever the first provider returns, which is sometimes the
+wrong take (a remix, a mistimed transcription…). Press **`f`** to open the
+picker and choose by hand:
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` (or `k` / `j`) | Move through the candidates |
+| `Enter` / `Space` | Preview the highlighted candidate, synced to the running track |
+| `w` | Save the highlighted candidate as the track's `.lrc` |
+| `+` / `-` | Adjust the offset (also affects the live preview) |
+| `f` / `Esc` / `q` | Close the picker |
+
+Candidates are gathered in the background from several sites:
+
+- **LrcLib** is queried directly and can return **several alternatives** for the
+  same song (different durations/takes), each shown with its metadata and line
+  count.
+- **Musixmatch, NetEase, Megalobiz, Genius** each contribute their single best
+  match through `syncedlyrics`.
+
+Each row is tagged `synced N` (timed, `N` lines) or `plain` (untimed text).
+Selecting a synced candidate scrolls its lyrics along with playback so you can
+judge the timing before committing. `w` writes the file **into the album
+folder** (next to the audio file) when it is writable, otherwise into the first
+`--lyrics-dir`, replacing any existing `.lrc`.
+
+---
+
 ## Where lyrics files are looked up
 
 1. Same folder as the audio file (e.g. `~/Music/Album/Track.lrc`)
@@ -155,7 +188,7 @@ When auto-fetch is enabled and no local file is found, `syncedlyrics` is queried
 
 ## Notes
 
-- The Musixmatch provider in `syncedlyrics` occasionally returns HTTP 401 — those log lines are silenced by default; other providers (LrcLib, NetEase) keep working transparently.
+- The Musixmatch provider in `syncedlyrics` occasionally returns HTTP 401 — those log lines are silenced by default; other providers (LrcLib, NetEase) keep working transparently. The `f` picker degrades the same way: providers that fail are marked with a small `✗` and the rest still populate the list.
 - Lyrics rendering is colorized: cyan for already-sung lines, light gray for upcoming ones, and bold white for the active line, with a `▶` cursor in front. Exact hues come from your terminal's ANSI palette, so they follow your theme (Kitty recommended).
 
 ---

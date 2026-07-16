@@ -16,13 +16,13 @@ jobs:
           python-version: '3.13'
           cache: pip
 
-      - name: Install runtime dep
-        # python-mpd2 is checked at module load; the script bails before
-        # --help can be reached if it's missing.
-        run: pip install python-mpd2
+      - name: Install runtime deps
+        # python-mpd2 is checked at startup; karaokay bails before --help can
+        # be reached if it's missing. requests backs the LrcLib picker.
+        run: pip install python-mpd2 requests
 
       - name: Syntax check
-        run: python -m py_compile karaokay.py
+        run: python -m py_compile karaokay/*.py
 
       - name: --help smoke test
-        run: python karaokay.py --help
+        run: python -m karaokay --help

@@ -31,3 +31,11 @@ def safe_currentsong(client: "MPDClient") -> dict:
         return client.currentsong()
     except Exception:
         return {}
+
+
+def safe_playlist(client: "MPDClient") -> list[dict]:
+    """The current queue, as MPD reports it (empty on any failure)."""
+    try:
+        return client.playlistinfo()
+    except Exception:
+        return []

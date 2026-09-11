@@ -9,12 +9,16 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from .mpd import make_client, safe_status, safe_currentsong, MPDClient
-from .lrc import LyricLine, parse_lrc, find_lrc, resolve_write_path
+from . import __version__
+from .mpd import (make_client, safe_status, safe_currentsong,
+                  safe_playlist, MPDClient)
+from .lrc import (LyricLine, load_lyrics, plain_lines, fmt_stamp,
+                  find_lyrics_file, resolve_write_path)
+from .edit import EditSession, session_for
 from .cover import CoverRenderer, find_cover
 from .fetch import (FetchSession, LyricCandidate, simple_search,
                     SYNCEDLYRICS_AVAILABLE, REQUESTS_AVAILABLE)
-from .util import fmt_time
+from .util import fmt_time, fit
 
 
 class KaraokeUI:
@@ -28,7 +32,11 @@ class KaraokeUI:
         self.offset   = args.offset  # ms
         self.music_dir: str            = args.music_dir or ""
         self.lyrics:   list[LyricLine] = []
-        self.lrc_path: Optional[str]   = None
+        # Untimed lyrics (a "plain" candidate saved from the picker): shown as
+        # a static, scrollable page since there is nothing to follow along.
+        self.plain:    list[str]       = []
+        self.plain_scroll              = 0
+        self.lyrics_path: Optional[str]   = None
         self.last_song: Optional[str]  = None
         self.client:   Optional[MPDClient] = None
 
@@ -54,7 +62,28 @@ class KaraokeUI:
         self.panel_sel   = 0
         self.panel_scroll = 0
         self.preview_cand: Optional[LyricCandidate] = None
+        # Timing editor (the `e` key) and the full-screen help (`h`).
+        self.edit: Optional[EditSession] = None
+        self.edit_confirm = False                  # leaving with unsaved edits
+        self._edit_rows: dict[int, int] = {}       # screen row → entry index
+        self.help_overlay = False
+        self.song: dict = {}                       # last song seen by the loop
+
+        # Playlist pane (the `l` key): the MPD queue on the right-hand side.
+        self.playlist_pane = False
+        self.playlist_pct  = getattr(args, "playlist_width", 50)
+        self.queue: list[dict] = []
+        self.queue_version: Optional[str] = None   # MPD's `playlist` counter
+        self.queue_cur     = -1                    # position of the playing song
+        self.queue_sel     = 0
+        self.queue_scroll  = 0
+        self._queue_follow = False                 # jump to the playing song
+        self._queue_rows: dict[int, int] = {}      # screen row → queue index
+        self._queue_x0: Optional[int] = None       # pane's left column
+
         self.panel_msg: Optional[str] = None      # transient status after a save
+        self.msg: Optional[str] = None            # toast shown in the main view
+        self.msg_until = 0.0                      # ... until this timestamp
         self._panel_rows: dict[int, int] = {}     # screen row → candidate index
 
         curses.curs_set(0)
@@ -150,9 +179,16 @@ class KaraokeUI:
         while True:
             key = self.stdscr.getch()
 
-            # The fetch panel captures navigation keys; anything it does not
-            # consume (playback +/-/p, resize) falls through to the globals.
-            if self.fetch_panel and self._handle_panel_key(key):
+            # Overlays and modes capture keys in order of focus; anything
+            # they do not consume (playback +/-/p, resize) falls through to
+            # the globals below.
+            if self.help_overlay and key != -1:
+                self._toggle_help()          # any key closes the cheat sheet
+            elif self.fetch_panel and self._handle_panel_key(key):
+                pass
+            elif self.edit is not None and self._handle_edit_key(key):
+                pass
+            elif self.playlist_pane and self._handle_playlist_key(key):
                 pass
             elif key in (ord("q"), ord("Q"), 27):
                 break
@@ -160,15 +196,29 @@ class KaraokeUI:
                 self.offset += 50
             elif key == ord("-"):
                 self.offset -= 50
+            elif key in (curses.KEY_UP, ord("k")):
+                self._scroll_plain(-1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self._scroll_plain(1)
+            elif key == curses.KEY_PPAGE:
+                self._scroll_plain(-10)
+            elif key == curses.KEY_NPAGE:
+                self._scroll_plain(10)
+            elif key == ord("l"):
+                self._toggle_playlist()
             elif key in (ord("s"), ord("S")):
                 # Forced resync: reload lyrics
                 self.last_song = None
             elif key in (ord("p"), ord("P")):
                 self._toggle_pause()
-            elif key in (ord("h"), ord("H")):
+            elif key in (ord("h"), ord("?")):
+                self._toggle_help()
+            elif key == ord("H"):
                 self.show_header = not self.show_header
                 self.stdscr.clear()
                 self._reset_cover()
+            elif key in (ord("e"), ord("E")):
+                self._toggle_edit()
             elif key in (ord("i"), ord("I")):
                 self.show_player = not self.show_player
                 self.stdscr.clear()
@@ -198,8 +248,21 @@ class KaraokeUI:
                 self.client = None
                 continue
 
+            self.song = song
             self._maybe_reload_lyrics(song)
+            self._refresh_queue(status)
             self._draw(status, song)
+
+    def _scroll_plain(self, delta: int):
+        """Scroll untimed lyrics; a no-op when the view follows timings."""
+        if self.lyrics or not self.plain:
+            return
+        self.plain_scroll = max(0, self.plain_scroll + delta)
+
+    def _toast(self, msg: str, seconds: float = 4.0):
+        """Show `msg` in place of the help line for a few seconds."""
+        self.msg = msg
+        self.msg_until = time.time() + seconds
 
     def _reset_cover(self):
         """After a full screen clear (resize/toggle) the cover must be wiped
@@ -241,6 +304,24 @@ class KaraokeUI:
         if self.cover_fullscreen:
             self._toggle_cover_fullscreen()
             return
+        # Playlist pane: a click selects a row, a click on the selected row
+        # plays it (the pane is tested first — it overlays the lyrics rows).
+        if self.playlist_pane and self._queue_x0 is not None and mx >= self._queue_x0:
+            idx = self._queue_rows.get(my)
+            if idx is not None:
+                if idx == self.queue_sel:
+                    self._play_selected()
+                else:
+                    self.queue_sel = idx
+            return
+        # Editor: a click stamps the clicked line with the current position.
+        if self.edit is not None:
+            if not self.edit_confirm:
+                idx = self._edit_rows.get(my)
+                if idx is not None:
+                    self.edit.sel = idx
+                    self._stamp_selected(advance=False)
+            return
         # Fetch panel: a click selects (and previews) the candidate row.
         if self.fetch_panel:
             idx = self._panel_rows.get(my)
@@ -275,6 +356,247 @@ class KaraokeUI:
         except Exception:
             self.client = None
 
+    # ── Timing editor ─────────────────────────────────────────────────────────
+
+    def _playback_time(self) -> float:
+        """Playback position right now, in lyric time (display offset applied).
+
+        Asked of MPD at the moment of the keystroke rather than reused from the
+        last frame: a stamp taken up to 100 ms late is a stamp worth redoing.
+        """
+        if not self.client:
+            return 0.0
+        try:
+            elapsed = float(safe_status(self.client).get("elapsed", 0))
+        except (TypeError, ValueError):
+            return 0.0
+        return max(0.0, elapsed + self.offset / 1000.0)
+
+    def _lyrics_source(self) -> Optional[str]:
+        """Raw content of the current lyrics file, .lrc or .txt alike."""
+        if not self.lyrics_path:
+            return None
+        try:
+            with open(self.lyrics_path, encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError:
+            return None
+
+    def _toggle_edit(self):
+        if self.edit is not None:
+            # Leaving: unsaved work gets a confirmation, an untouched session
+            # just closes.
+            if self.edit.changes:
+                self.edit_confirm = True
+            else:
+                self._close_edit()
+            return
+
+        session = session_for(self._lyrics_source())
+        if session is None:
+            self._toast("nothing to edit — press f to fetch lyrics, "
+                        "or drop a .txt next to the audio file")
+            return
+        # Start on the line playing right now, the one most likely to be wrong.
+        session.sel = max(0, session.active_index(self._playback_time()))
+        self.edit = session
+        self.edit_confirm = False
+        if self.fetch_panel:
+            self._close_fetch_panel()
+        self.stdscr.clear()
+        self._reset_cover()
+
+    def _close_edit(self):
+        self.edit = None
+        self.edit_confirm = False
+        self._edit_rows = {}
+        self.stdscr.clear()
+        self._reset_cover()
+
+    def _stamp_selected(self, advance: bool):
+        """Give the selected line the current playback position."""
+        if not self.edit:
+            return
+        self.edit.set_time(self.edit.sel, self._playback_time())
+        if advance:
+            self.edit.move(1)
+
+    def _save_edit(self):
+        if not self.edit:
+            return
+        # An .lrc being retimed is written back where it was found; plain text
+        # (or nothing) falls back to the usual destination, so a .txt is never
+        # overwritten by its own synced version.
+        if self.lyrics_path and self.lyrics_path.lower().endswith(".lrc"):
+            path = self.lyrics_path
+        else:
+            path = resolve_write_path(self.song, self.music_dir,
+                                      self.args.lyrics_dir)
+        if not path:
+            self._toast("no writable location for the .lrc")
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.edit.to_lrc())
+        except OSError as e:
+            self._toast(f"write failed: {e}")
+            return
+        count = self.edit.changes
+        self.edit.mark_saved()
+        self._toast(f"saved {count} timing change(s) → {os.path.basename(path)}")
+        # Pick the file back up so the main view shows what was just written.
+        self.last_song = None
+        with self.fetch_lock:
+            self.fetch_state = None
+        self._close_edit()
+
+    def _handle_edit_key(self, key) -> bool:
+        """Return True if the key was consumed by the editor."""
+        session = self.edit
+        if session is None:
+            return False
+
+        # Confirmation prompt: only enter and escape answer it, so a stray key
+        # can neither discard the work nor write the file.
+        if self.edit_confirm:
+            if key in (curses.KEY_ENTER, 10, 13):
+                self._save_edit()
+            elif key == 27:
+                self._toast("edits discarded")
+                self._close_edit()
+            return True
+
+        if key in (curses.KEY_UP, ord("k")):
+            session.move(-1)
+            return True
+        if key in (curses.KEY_DOWN, ord("j")):
+            session.move(1)
+            return True
+        if key == curses.KEY_PPAGE:
+            session.move(-10)
+            return True
+        if key == curses.KEY_NPAGE:
+            session.move(10)
+            return True
+        if key in (curses.KEY_HOME, ord("g")):
+            session.sel = 0
+            return True
+        if key in (curses.KEY_END, ord("G")):
+            session.sel = max(0, len(session.entries) - 1)
+            return True
+        if key == ord(" "):
+            self._stamp_selected(advance=True)
+            return True
+        if key in (curses.KEY_ENTER, 10, 13):
+            # Listen back: jump playback to the selected line.
+            entry = session.entries[session.sel] if session.entries else None
+            if entry and entry.time is not None:
+                self._seek_to_time(max(0.0, entry.time - self.offset / 1000.0))
+            return True
+        if key in (curses.KEY_LEFT, ord("<"), ord(",")):
+            session.nudge(session.sel, -1)
+            return True
+        if key in (curses.KEY_RIGHT, ord(">"), ord(".")):
+            session.nudge(session.sel, 1)
+            return True
+        if key in (ord("x"), ord("X"), curses.KEY_DC):
+            session.clear_time(session.sel)
+            return True
+        if key in (ord("e"), ord("E"), 27):
+            self._toggle_edit()
+            return True
+        if key in (ord("f"), ord("F")):
+            # Fetching would overwrite the very file being retimed.
+            self._toast("close the editor first (e) to fetch other lyrics")
+            return True
+        if key == curses.KEY_MOUSE:
+            self._handle_mouse()
+            return True
+        # p (pause), +/- (offset) and resize stay global.
+        return False
+
+    # ── Playlist pane ────────────────────────────────────────────────────────
+
+    def _toggle_playlist(self):
+        self.playlist_pane = not self.playlist_pane
+        if self.playlist_pane:
+            # Open on the song being played rather than at the top. The
+            # position is only known once the queue has been read, so the jump
+            # is deferred to the refresh below.
+            self.queue_version = None            # force a refresh this frame
+            self._queue_follow = True
+        self.stdscr.clear()
+        self._reset_cover()
+
+    def _refresh_queue(self, status: dict):
+        """Re-read the queue when MPD says it changed, and only then.
+
+        MPD bumps `playlist` (a version counter) on every queue edit, so the
+        pane can stay in sync without polling `playlistinfo` every frame.
+        """
+        if not self.playlist_pane or not self.client:
+            return
+        try:
+            self.queue_cur = int(status.get("song", -1))
+        except (TypeError, ValueError):
+            self.queue_cur = -1
+        version = status.get("playlist")
+        if version is not None and version == self.queue_version:
+            return
+        self.queue = safe_playlist(self.client)
+        self.queue_version = version
+        if self._queue_follow and self.queue_cur >= 0:
+            self.queue_sel = self.queue_cur
+            self._queue_follow = False
+        if self.queue_sel >= len(self.queue):
+            self.queue_sel = max(0, len(self.queue) - 1)
+
+    def _move_queue(self, delta: int):
+        if not self.queue:
+            return
+        self.queue_sel = max(0, min(len(self.queue) - 1, self.queue_sel + delta))
+
+    def _play_selected(self):
+        """Start the highlighted queue entry."""
+        if not (self.client and 0 <= self.queue_sel < len(self.queue)):
+            return
+        entry = self.queue[self.queue_sel]
+        try:
+            self.client.play(int(entry.get("pos", self.queue_sel)))
+        except Exception:
+            self.client = None
+            return
+        # Jump to the new track without waiting for the next poll.
+        self.last_song = None
+
+    def _handle_playlist_key(self, key) -> bool:
+        """Return True if the key was consumed by the playlist pane."""
+        if key in (curses.KEY_UP, ord("k")):
+            self._move_queue(-1)
+            return True
+        if key in (curses.KEY_DOWN, ord("j")):
+            self._move_queue(1)
+            return True
+        if key == curses.KEY_PPAGE:
+            self._move_queue(-10)
+            return True
+        if key == curses.KEY_NPAGE:
+            self._move_queue(10)
+            return True
+        if key in (curses.KEY_HOME, ord("g")):
+            self.queue_sel = 0
+            return True
+        if key in (curses.KEY_END, ord("G")):
+            self.queue_sel = max(0, len(self.queue) - 1)
+            return True
+        if key in (curses.KEY_ENTER, 10, 13):
+            self._play_selected()
+            return True
+        if key == 27:                 # Esc closes the pane instead of quitting
+            self._toggle_playlist()
+            return True
+        return False
+
     # ── Interactive fetch panel ─────────────────────────────────────────────
 
     def _open_fetch_panel(self):
@@ -285,7 +607,7 @@ class KaraokeUI:
         artist = (song.get("artist") or "").strip()
         query  = f"{title} {artist}".strip()
         if not query:
-            self.panel_msg = "no track metadata to search with"
+            self._toast("no track metadata to search with")
             return
         self._panel_song   = song
         self.fetch_session = FetchSession(query)
@@ -362,7 +684,8 @@ class KaraokeUI:
         except OSError as e:
             self.panel_msg = f"write failed: {e}"
             return
-        self.panel_msg = f"saved [{cand.provider}] → {os.path.basename(path)}"
+        kind = f"{len(cand.lines)} synced lines" if cand.synced else "plain text"
+        self._toast(f"saved [{cand.provider}] {kind} → {os.path.basename(path)}")
         # Force a reload so the freshly written file is picked up immediately,
         # and clear any earlier autofetch failure for this track.
         self.last_song = None
@@ -428,24 +751,32 @@ class KaraokeUI:
 
     # ── Lyrics reload ─────────────────────────────────────────────────────────
 
+    def _load_lrc_for(self, song: dict):
+        """Locate and read the track's lyrics file into `lyrics` / `plain`."""
+        self.lyrics_path = find_lyrics_file(song, self.args.lyrics_dir, self.music_dir)
+        if self.lyrics_path:
+            self.lyrics, self.plain = load_lyrics(self.lyrics_path)
+        else:
+            self.lyrics, self.plain = [], []
+        self.plain_scroll = 0
+
     def _maybe_reload_lyrics(self, song: dict):
         song_id = song.get("id") or song.get("file")
         if song_id == self.last_song:
             # Has the autofetch thread dropped a file?
             with self.fetch_lock:
-                ready = self.fetch_state == "found" and not self.lyrics
+                ready = (self.fetch_state == "found"
+                         and not self.lyrics and not self.plain)
                 if ready:
                     self.fetch_state = None
             if ready:
-                self.lrc_path = find_lrc(song, self.args.lyrics_dir, self.music_dir)
-                self.lyrics   = parse_lrc(self.lrc_path) if self.lrc_path else []
+                self._load_lrc_for(song)
             return
         self.last_song = song_id
-        self.lrc_path  = find_lrc(song, self.args.lyrics_dir, self.music_dir)
-        self.lyrics    = parse_lrc(self.lrc_path) if self.lrc_path else []
+        self._load_lrc_for(song)
         self.cover_path = find_cover(song, self.music_dir)
         self._cover_dirty = True
-        if not self.lrc_path:
+        if not self.lyrics_path:
             self._start_autofetch(song)
         else:
             with self.fetch_lock:
@@ -463,6 +794,13 @@ class KaraokeUI:
         self._prog_bar = None
         self._cover_rect = None
         self._panel_rows = {}
+        self._edit_rows = {}
+
+        # The cheat sheet takes over the whole screen until a key is pressed.
+        if self.help_overlay:
+            self._draw_help(h, w)
+            self.stdscr.refresh()
+            return
 
         # Fullscreen cover takes over the whole screen (click to return).
         if self.cover_fullscreen:
@@ -473,6 +811,13 @@ class KaraokeUI:
             self.cover_fullscreen = False
             self.stdscr.clear()
             self.cover.hide()
+
+        # The playlist pane owns the right-hand columns; everything below
+        # draws inside the remaining width, so `w` is narrowed here and the
+        # full width kept aside for the pane itself.
+        full_w = w
+        pane_w = self._pane_width(w) if self.playlist_pane else 0
+        w      = full_w - pane_w
 
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
@@ -496,8 +841,12 @@ class KaraokeUI:
             state = status.get("state", "stop")
             state_icon = {"play": "▶", "pause": "⏸", "stop": "■"}.get(state, "?")
             connected  = f"{state_icon} MPD {self.args.host}:{self.args.port}"
-            if self.lrc_path:
-                lrc_info = f"  LRC: {os.path.basename(self.lrc_path)}"
+            if self.lyrics_path:
+                # Plain text is a legitimate source now, so the label follows
+                # the file rather than always claiming "LRC".
+                tag  = "TXT" if self.lyrics_path.lower().endswith(".txt") else "LRC"
+                kind = "  (plain)" if (self.plain and not self.lyrics) else ""
+                lrc_info = f"  {tag}: {os.path.basename(self.lyrics_path)}{kind}"
             else:
                 with self.fetch_lock:
                     fs = self.fetch_state
@@ -554,18 +903,37 @@ class KaraokeUI:
 
         elapsed_adj = elapsed_raw + self.offset / 1000.0
 
-        # — Body: either the fetch panel or the lyrics —————————————
-        if self.fetch_panel:
+        # — Body: the editor, the fetch panel, or the lyrics ——————————
+        if self.edit is not None:
+            self._draw_edit(row, h, w, elapsed_adj)
+            help_str = self._edit_help()
+        elif self.fetch_panel:
             self._draw_panel(row, h, w, elapsed_adj)
             help_str = (" ↑↓/jk:move  enter:preview  w:save  +/-:offset "
                         " f/esc:close ")
         else:
             self._draw_lyrics(row, h, w, elapsed_adj)
-            help_str = (" q:quit  p:play/pause  +/-:offset  s:resync  f:fetch "
-                        " h:header  i:player  c:cover ")
+            if self.playlist_pane:
+                # The pane carries its own key hints, so the line is trimmed to
+                # what still fits beside it.
+                help_str = " q:quit  p:play/pause  f:fetch  e:edit  h:help "
+            else:
+                help_str = (" q:quit  p:play/pause  +/-:offset  s:resync "
+                            " f:fetch  e:edit  l:playlist  h:help ")
+                if self.plain and not self.lyrics:
+                    help_str = " ↑↓/jk:scroll " + help_str
 
-        # — Help at the bottom —————————————————————————————————
-        self._addstr(h - 1, 0, help_str[:w], curses.color_pair(3))
+        # — Help at the bottom, or the transient toast that replaces it ————
+        if self.msg and time.time() < self.msg_until:
+            self._addstr(h - 1, 0, f" {self.msg} "[:w],
+                         curses.color_pair(4) | curses.A_BOLD)
+        else:
+            self.msg = None
+            self._addstr(h - 1, 0, help_str[:w], curses.color_pair(3))
+
+        # — Playlist pane on the right ————————————————————————
+        if pane_w:
+            self._draw_playlist(w, h, pane_w)
 
         self.stdscr.refresh()
 
@@ -596,16 +964,42 @@ class KaraokeUI:
         if fs == "error":
             return "Autofetch failed — press f to search for lyrics yourself"
         # disabled / no_module / no_meta / none / cleared: the plain hint.
-        return "No lyrics — press f to fetch, or drop a .lrc next to the audio file"
+        return ("No lyrics — press f to fetch, or drop a .lrc/.txt "
+                "next to the audio file")
 
     def _draw_lyrics(self, row: int, h: int, w: int, elapsed_adj: float):
         if not self.lyrics:
-            self._addstr(row, 2, self._no_lyrics_msg()[:w - 2],
-                         curses.color_pair(5))
+            if self.plain:
+                self._draw_plain_lyrics(row, h, w)
+            else:
+                self._addstr(row, 2, self._no_lyrics_msg()[:w - 2],
+                             curses.color_pair(5))
             return
         avail = max(1, h - row - 2)  # available lines (- help at the bottom)
         self._draw_lyric_lines(self.lyrics, row, avail, h, w, elapsed_adj,
                                clickable=True)
+
+    def _draw_plain_lyrics(self, row: int, h: int, w: int):
+        """Render untimed lyrics as a static, scrollable page.
+
+        Nothing can be followed along here, so the whole text is shown plainly
+        with a one-line banner making the lack of timings explicit.
+        """
+        self._addstr(row, 2,
+                     "Unsynchronized lyrics — ↑↓/jk to scroll, e to time them"[:w - 2],
+                     curses.color_pair(5))
+        row += 1
+        avail = max(1, h - row - 2)
+        self.plain_scroll = max(0, min(self.plain_scroll,
+                                       max(0, len(self.plain) - avail)))
+        visible = self.plain[self.plain_scroll:self.plain_scroll + avail]
+        for i, text in enumerate(visible):
+            self._addstr(row + i, 2, text[:w - 2], curses.color_pair(2))
+        # Scroll hint when the text runs past the bottom of the screen.
+        if len(self.plain) > avail:
+            pos = f" {self.plain_scroll + 1}-{self.plain_scroll + len(visible)}/{len(self.plain)} "
+            self._addstr(row - 1, max(0, w - len(pos)), pos[:w],
+                         curses.color_pair(3))
 
     def _draw_lyric_lines(self, lines: list[LyricLine], top_row: int, avail: int,
                           h: int, w: int, elapsed_adj: float, clickable: bool):
@@ -725,8 +1119,9 @@ class KaraokeUI:
                 dur      = f" {fmt_time(cand.duration)}" if cand.duration else ""
                 text = f"{marker}[{cand.provider}] {cand.label()}"
                 meta = f"{kind}{dur}"
-                # Right-align the meta chip when there is room.
-                pad  = max(1, w - 2 - len(text) - len(meta))
+                # Right-align the meta chip when there is room, keeping one
+                # column of margin (the playlist pane may sit right there).
+                pad  = max(1, w - 3 - len(text) - len(meta))
                 line = (text + " " * pad + meta) if pad > 1 else text
                 attr = (curses.color_pair(1) | curses.A_BOLD if selected
                         else curses.color_pair(3))
@@ -742,11 +1137,274 @@ class KaraokeUI:
                                        elapsed_adj, clickable=False)
             else:
                 # Plain text: show the opening lines statically.
-                body = cand.text.strip().splitlines()
+                body = plain_lines(cand.text)
                 for i, txt in enumerate(body[:preview_h]):
                     if prow + i >= h - 1:
                         break
                     self._addstr(prow + i, 4, txt[:w - 4], curses.color_pair(3))
+
+    # ── Timing editor area ────────────────────────────────────────────────────
+
+    NO_STAMP = "--:--.--"
+
+    def _draw_edit(self, row: int, h: int, w: int, elapsed_adj: float):
+        """Render the editor: every line with its timestamp, cursor included."""
+        session = self.edit
+        name = os.path.basename(self.lyrics_path) if self.lyrics_path else "(new)"
+        self._addstr(row, 2, f"Edit timings: {name}"[:w - 2],
+                     curses.color_pair(4) | curses.A_BOLD)
+        row += 1
+        sub = f"{session.timed}/{len(session.entries)} lines timed"
+        if session.changes:
+            sub += f"  ·  {session.changes} unsaved"
+        self._addstr(row, 2, sub[:w - 2], curses.color_pair(3))
+        row += 1
+        self._hline(row, w); row += 1
+
+        avail = max(1, h - row - 2)
+        if session.sel < session.scroll:
+            session.scroll = session.sel
+        elif session.sel >= session.scroll + avail:
+            session.scroll = session.sel - avail + 1
+        session.scroll = max(0, min(session.scroll,
+                                    max(0, len(session.entries) - avail)))
+
+        active  = session.active_index(elapsed_adj)
+        visible = session.entries[session.scroll:session.scroll + avail]
+        for i, entry in enumerate(visible):
+            idx = session.scroll + i
+            y   = row + i
+            self._edit_rows[y] = idx
+            stamp = fmt_stamp(entry.time) if entry.time is not None else self.NO_STAMP
+            if idx == active:
+                attr = curses.color_pair(1) | curses.A_BOLD   # playing now
+            elif entry.time is None:
+                attr = curses.color_pair(5)                   # still untimed
+            else:
+                attr = curses.color_pair(2)
+            if idx == session.sel:
+                attr |= curses.A_REVERSE
+            line = f" [{stamp}] {entry.text}"
+            self._addstr(y, 1, line.ljust(w - 2)[:w - 2], attr)
+
+    def _edit_help(self) -> str:
+        if self.edit_confirm:
+            n = self.edit.changes if self.edit else 0
+            return f" Save {n} change(s)?   enter:save   esc:discard "
+        return (" space:stamp  ↑↓:line  ←→:nudge ±0.1s  x:clear  "
+                "enter:listen  p:pause  e:done ")
+
+    # ── Full-screen help ──────────────────────────────────────────────────────
+
+    HELP_SECTIONS = (
+        ("Playback", (
+            ("p",          "play / pause"),
+            ("+ / -",      "shift lyrics 50 ms later / earlier"),
+            ("s",          "resync — reload the lyrics file"),
+        )),
+        ("Display", (
+            ("H",          "status header"),
+            ("i",          "now-playing block"),
+            ("c",          "album cover"),
+            ("h / ?",      "this help"),
+            ("q / Esc",    "quit"),
+        )),
+        ("Lyrics", (
+            ("f",          "fetch: pick lyrics from several sites"),
+            ("e",          "edit the timings of the current lyrics"),
+            ("↑↓ / jk",    "scroll unsynchronized lyrics"),
+        )),
+        ("Playlist (l)", (
+            ("l",          "show / hide the queue"),
+            ("↑↓ / jk",    "move the selection"),
+            ("g / G",      "first / last entry"),
+            ("enter",      "play the selected track"),
+        )),
+        ("Editor (e)", (
+            ("space",      "stamp the line with the current position"),
+            ("←→ / <>",    "nudge the line by ±0.1 s"),
+            ("x",          "clear the line's timestamp"),
+            ("enter",      "listen: seek to the selected line"),
+            ("e / Esc",    "leave (asks before dropping edits)"),
+        )),
+        ("Mouse", (
+            ("click lyric","seek to that line"),
+            ("click bar",  "seek in the track"),
+            ("click cover","fullscreen artwork"),
+            ("in editor",  "stamp the clicked line"),
+        )),
+    )
+
+    def _toggle_help(self):
+        self.help_overlay = not self.help_overlay
+        self.stdscr.clear()
+        self._reset_cover()
+
+    def _draw_help(self, h: int, w: int):
+        """The cheat sheet, in two columns when the terminal is wide enough."""
+        self.cover.hide()
+        title = f"karaokay {__version__} — keyboard shortcuts"
+        self._addstr(0, max(0, (w - len(title)) // 2), title[:w],
+                     curses.color_pair(4) | curses.A_BOLD)
+
+        blocks: list[list[tuple[str, str, int]]] = []
+        for name, keys in self.HELP_SECTIONS:
+            block: list[tuple[str, str, int]] = [(name, "", 4)]
+            block += [(k, desc, 0) for k, desc in keys]
+            block.append(("", "", 0))
+            blocks.append(block)
+
+        two_col = w >= 76
+        if two_col:
+            half     = (len(blocks) + 1) // 2
+            columns  = [sum(blocks[:half], []), sum(blocks[half:], [])]
+            col_w    = w // 2
+        else:
+            columns, col_w = [sum(blocks, [])], w
+        # Drop the trailing blank of each column: on a short terminal that one
+        # line is the difference between fitting and being cut off.
+        columns = [col[:-1] if col and not col[-1][0] else col for col in columns]
+
+        for ci, column in enumerate(columns):
+            x = 2 + ci * col_w
+            for i, (key, desc, kind) in enumerate(column):
+                y = 2 + i
+                if y >= h - 1:
+                    break
+                if kind == 4:                      # section title
+                    self._addstr(y, x, key[:col_w - 2],
+                                 curses.color_pair(4) | curses.A_BOLD)
+                elif key:
+                    self._addstr(y, x, key.rjust(11)[:col_w - 2],
+                                 curses.color_pair(1) | curses.A_BOLD)
+                    self._addstr(y, x + 13, desc[:max(0, col_w - 15)],
+                                 curses.color_pair(3))
+
+        hint = "press any key to close"
+        self._addstr(h - 1, max(0, (w - len(hint)) // 2), hint[:w],
+                     curses.color_pair(3))
+
+    # ── Playlist pane area ────────────────────────────────────────────────────
+
+    # Fixed-width columns; the rest of the room goes to the title.
+    TRACK_W = 2
+    TIME_W  = 5
+
+    def _pane_width(self, w: int) -> int:
+        """Pane width in columns, from the configured percentage.
+
+        Kept wide enough to show something useful and narrow enough to leave
+        the lyrics readable; on a very narrow terminal the pane wins, since it
+        is only shown on demand.
+        """
+        want = int(w * self.playlist_pct / 100)
+        return max(0, min(w - 8, max(18, want)))
+
+    def _queue_columns(self, inner: int) -> tuple[int, int, int]:
+        """(artist, title, album) widths for `inner` usable columns.
+
+        Artist and album are dropped as the pane narrows, so the title — the
+        one column that always matters — keeps its room.
+        """
+        rest = inner - self.TRACK_W - 1 - self.TIME_W - 1
+        if rest >= 46:
+            # Artist and album scale with the pane, the title keeps the rest.
+            artist = min(20, max(12, int(rest * 0.20)))
+            album  = min(20, max(10, int(rest * 0.18)))
+            return artist, rest - artist - album - 2, album
+        if rest >= 30:
+            artist = 10
+            return artist, rest - artist - 1, 0
+        return 0, max(1, rest), 0
+
+    def _queue_row(self, entry: dict, widths: tuple[int, int, int]) -> str:
+        """Format one queue entry as a column-aligned row."""
+        artist_w, title_w, album_w = widths
+        title = (entry.get("title") or "").strip() or Path(entry.get("file", "?")).stem
+        # MPD reports `track` as "7" or "7/12" depending on the tagger.
+        track = (entry.get("track") or "").split("/")[0].strip()
+        track = track.zfill(self.TRACK_W) if track.isdigit() else "  "
+        secs  = entry.get("duration") or entry.get("time") or 0
+        try:
+            dur = fmt_time(float(secs))
+        except (TypeError, ValueError):
+            dur = ""
+        cells = []
+        if artist_w:
+            cells.append(fit((entry.get("artist") or "").strip(), artist_w))
+        cells.append(track[:self.TRACK_W])
+        cells.append(fit(title, title_w))
+        if album_w:
+            cells.append(fit((entry.get("album") or "").strip(), album_w))
+        cells.append(dur.rjust(self.TIME_W))
+        return " ".join(cells)
+
+    def _queue_header(self, widths: tuple[int, int, int]) -> str:
+        artist_w, title_w, album_w = widths
+        cells = []
+        if artist_w:
+            cells.append(fit("Artist", artist_w))
+        cells.append("#".ljust(self.TRACK_W))
+        cells.append(fit("Title", title_w))
+        if album_w:
+            cells.append(fit("Album", album_w))
+        cells.append("Time".rjust(self.TIME_W))
+        return " ".join(cells)
+
+    def _draw_playlist(self, x0: int, h: int, pane_w: int):
+        """Render the MPD queue in the right-hand pane.
+
+        Column headers on top, a footer with the position, and — between the
+        two — the queue scrolled to keep the selection visible. The playing
+        track is marked, the selected one highlighted.
+        """
+        self._queue_rows = {}
+        self._queue_x0   = x0
+        # Vertical rule separating the pane from the lyrics.
+        for y in range(h):
+            self._addstr(y, x0, "│", curses.color_pair(3))
+        left   = x0 + 2                  # first content column
+        inner  = max(1, pane_w - 3)
+        widths = self._queue_columns(inner)
+
+        self._addstr(0, left, self._queue_header(widths)[:inner],
+                     curses.color_pair(4) | curses.A_BOLD)
+
+        avail = max(1, h - 2)            # minus the header and the footer
+        if not self.queue:
+            self._addstr(1, left, "(queue empty)"[:inner], curses.color_pair(5))
+            return
+
+        # Keep the selection inside the visible window.
+        if self.queue_sel < self.queue_scroll:
+            self.queue_scroll = self.queue_sel
+        elif self.queue_sel >= self.queue_scroll + avail:
+            self.queue_scroll = self.queue_sel - avail + 1
+        self.queue_scroll = max(0, min(self.queue_scroll,
+                                       max(0, len(self.queue) - avail)))
+
+        visible = self.queue[self.queue_scroll:self.queue_scroll + avail]
+        for i, entry in enumerate(visible):
+            idx  = self.queue_scroll + i
+            y    = 1 + i
+            self._queue_rows[y] = idx
+            playing  = idx == self.queue_cur
+            selected = idx == self.queue_sel
+            if playing:
+                attr = curses.color_pair(1) | curses.A_BOLD
+            else:
+                attr = curses.color_pair(2)
+            if selected:
+                attr |= curses.A_REVERSE
+            text = self._queue_row(entry, widths)
+            # The row spans the pane so a selected one reads as a full bar.
+            span = max(1, pane_w - 1)
+            self._addstr(y, x0 + 1, (" " + text).ljust(span)[:span], attr)
+            if playing:
+                self._addstr(y, x0 + 1, "▶", attr)
+
+        footer = f" {self.queue_sel + 1}/{len(self.queue)}  enter:play  l:close "
+        self._addstr(h - 1, left, footer[:inner], curses.color_pair(3))
 
     def _draw_cover_fullscreen(self, h: int, w: int):
         """Render the cover as a large centered square filling the terminal,

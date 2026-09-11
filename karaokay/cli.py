@@ -6,7 +6,7 @@ import curses
 import logging
 import argparse
 
-from . import __version__
+from . import __version__, config
 from .mpd import MPD_AVAILABLE
 from .ui import KaraokeUI
 
@@ -23,6 +23,11 @@ BANNER = """
   ▀                        ███    ███                           ▀
 """
 
+# Playlist pane width, as a percentage of the terminal width.
+DEFAULT_PLAYLIST_WIDTH = 50
+PLAYLIST_WIDTH_MIN     = 20
+PLAYLIST_WIDTH_MAX     = 80
+
 # Silence noisy logs from syncedlyrics providers (e.g. Musixmatch 401)
 logging.getLogger("syncedlyrics").setLevel(logging.CRITICAL)
 logging.getLogger("root").setLevel(logging.CRITICAL)
@@ -37,6 +42,8 @@ def main():
     p = argparse.ArgumentParser(
         prog="karaokay",
         description=f"{BANNER}\nKaraoke CLI synchronized with MPD",
+        epilog=f"Defaults are read from {config.config_path()} "
+               "(YAML); the flags above override it.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action="version",
@@ -60,11 +67,33 @@ def main():
     p.add_argument("--cover-protocol", default="auto",
                    choices=["auto", "kitty", "iterm2", "blocks", "blocks256", "none"],
                    help="Cover rendering backend (default: auto-detect)")
+    p.add_argument("--playlist-width", type=int, default=DEFAULT_PLAYLIST_WIDTH,
+                   metavar="PCT",
+                   help="Width of the `l` playlist pane, in %% of the screen "
+                        f"({PLAYLIST_WIDTH_MIN}-{PLAYLIST_WIDTH_MAX}, default: "
+                        f"{DEFAULT_PLAYLIST_WIDTH})")
+
+    # The config file supplies the defaults; the flags above still win, since
+    # argparse only falls back to a default when the flag is absent.
+    cfg, warnings = config.load()
+    cfg_lyrics_dir = cfg.pop("lyrics_dir", [])
+    p.set_defaults(**cfg)
     args = p.parse_args()
 
-    # Default folder
+    # `--lyrics-dir` appends, so it is merged by hand: the flag replaces the
+    # configured folders rather than adding to them.
     if not args.lyrics_dir:
-        args.lyrics_dir = [os.path.expanduser("~/.lyrics")]
+        args.lyrics_dir = cfg_lyrics_dir or [os.path.expanduser("~/.lyrics")]
+
+    if not PLAYLIST_WIDTH_MIN <= args.playlist_width <= PLAYLIST_WIDTH_MAX:
+        clamped = max(PLAYLIST_WIDTH_MIN, min(PLAYLIST_WIDTH_MAX, args.playlist_width))
+        warnings.append(f"playlist-width {args.playlist_width}% out of range "
+                        f"({PLAYLIST_WIDTH_MIN}-{PLAYLIST_WIDTH_MAX}) — using {clamped}%")
+        args.playlist_width = clamped
+
+    # Reported before curses takes over the screen.
+    for line in warnings:
+        print(f"karaokay: {line}", file=sys.stderr)
 
     try:
         curses.wrapper(lambda s: KaraokeUI(s, args).run())

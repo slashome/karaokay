@@ -25,6 +25,9 @@ dependencies = [
 
 [project.optional-dependencies]
 cover = ["pillow>=9"]
+# Only needed for exotic YAML in the config file: the flat `key: value` subset
+# documented in the README is read by a built-in parser when PyYAML is absent.
+config = ["pyyaml>=6"]
 
 [project.scripts]
 karaokay = "karaokay.cli:main"

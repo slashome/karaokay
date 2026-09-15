@@ -2,6 +2,7 @@
 
 import os
 import re
+import codecs
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional
@@ -117,6 +118,53 @@ def fmt_stamp(t: float) -> str:
     return f"{cs // 6000:02d}:{cs // 100 % 60:02d}.{cs % 100:02d}"
 
 
+# ── Reading lyrics files ──────────────────────────────────────────────────────
+
+def decode_lyrics(data: bytes) -> str:
+    """Decode a lyrics file, UTF-8 by default but UTF-16 when it says so.
+
+    Lyrics dropped next to a track come from everywhere — a browser, Notepad,
+    a tag editor — and some of them are UTF-16. Read as UTF-8 such a file
+    decodes into text riddled with NUL characters, which curses refuses to
+    draw, so the encoding is settled here rather than papered over later.
+    """
+    for bom, enc in ((codecs.BOM_UTF8, "utf-8-sig"),
+                     (codecs.BOM_UTF32_LE, "utf-32"),
+                     (codecs.BOM_UTF32_BE, "utf-32"),
+                     (codecs.BOM_UTF16_LE, "utf-16"),
+                     (codecs.BOM_UTF16_BE, "utf-16")):
+        if data.startswith(bom):
+            try:
+                return data.decode(enc)
+            except (UnicodeDecodeError, LookupError):
+                break
+    # No BOM: UTF-16 still gives itself away with a NUL in every other byte —
+    # on the odd bytes when it is little-endian, on the even ones when it is
+    # big-endian. Whichever side carries more of them is tried first.
+    if b"\x00" in data:
+        little = data[1::2].count(0) >= data[0::2].count(0)
+        for enc in ("utf-16-le", "utf-16-be") if little else ("utf-16-be", "utf-16-le"):
+            try:
+                text = data.decode(enc)
+            except UnicodeDecodeError:
+                continue
+            if "\x00" not in text:
+                return text
+    # Anything left: UTF-8 with replacements, minus the NULs a truly binary
+    # file would carry — they would travel into the editor and back out into
+    # a saved .lrc.
+    return data.decode("utf-8", errors="replace").replace("\x00", "")
+
+
+def read_lyrics_file(path: str) -> Optional[str]:
+    """File content as text, or None when it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            return decode_lyrics(f.read())
+    except OSError:
+        return None
+
+
 def load_lyrics(path: str) -> tuple[list[LyricLine], list[str]]:
     """Read a lyrics file as either timed lines or untimed text.
 
@@ -124,10 +172,8 @@ def load_lyrics(path: str) -> tuple[list[LyricLine], list[str]]:
     when it does not (a plain-text candidate saved from the `f` picker), and
     `([], [])` when it is unreadable or empty.
     """
-    try:
-        with open(path, encoding="utf-8", errors="replace") as f:
-            text = f.read()
-    except OSError:
+    text = read_lyrics_file(path)
+    if text is None:
         return [], []
     timed = parse_lrc_text(text)
     if timed:

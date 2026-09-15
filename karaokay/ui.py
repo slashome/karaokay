@@ -13,12 +13,12 @@ from . import __version__
 from .mpd import (make_client, safe_status, safe_currentsong,
                   safe_playlist, MPDClient)
 from .lrc import (LyricLine, load_lyrics, plain_lines, fmt_stamp,
-                  find_lyrics_file, resolve_write_path)
+                  find_lyrics_file, read_lyrics_file, resolve_write_path)
 from .edit import EditSession, session_for
 from .cover import CoverRenderer, find_cover
 from .fetch import (FetchSession, LyricCandidate, simple_search,
                     SYNCEDLYRICS_AVAILABLE, REQUESTS_AVAILABLE)
-from .util import fmt_time, fit
+from .util import fmt_time, fit, printable
 
 
 class KaraokeUI:
@@ -376,11 +376,7 @@ class KaraokeUI:
         """Raw content of the current lyrics file, .lrc or .txt alike."""
         if not self.lyrics_path:
             return None
-        try:
-            with open(self.lyrics_path, encoding="utf-8", errors="replace") as f:
-                return f.read()
-        except OSError:
-            return None
+        return read_lyrics_file(self.lyrics_path)
 
     def _toggle_edit(self):
         if self.edit is not None:
@@ -1433,8 +1429,8 @@ class KaraokeUI:
 
     def _addstr(self, y, x, text, attr=0):
         try:
-            self.stdscr.addstr(y, x, text, attr)
-        except curses.error:
+            self.stdscr.addstr(y, x, printable(text), attr)
+        except (curses.error, ValueError):
             pass
 
     def _hline(self, y, w, x0=0):

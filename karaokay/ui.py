@@ -25,6 +25,9 @@ class KaraokeUI:
     # Ratio of lines displayed before the active line (the rest goes after).
     # 0.33 = the active line sits at ~1/3 from the top of the lyrics area.
     BEFORE_RATIO = 0.33
+    # Cover view: the artwork grows as large as it can on the left, as long as
+    # the lyrics keep at least this many columns on the right.
+    COVER_VIEW_MIN_LYRICS_W = 40
 
     def __init__(self, stdscr, args):
         self.stdscr   = stdscr
@@ -47,7 +50,7 @@ class KaraokeUI:
         self.cover       = CoverRenderer(getattr(args, "cover_protocol", "auto"))
         self.cover_path: Optional[str] = None
         self._cover_dirty = False   # force a cover redraw on next frame
-        self.cover_fullscreen = False   # cover blown up to fill the terminal
+        self.cover_fullscreen = False   # cover view: big artwork left, lyrics right
 
         # Automatic autofetch (background, silent) — runs when no local .lrc.
         self.fetch_lock = threading.Lock()
@@ -271,7 +274,7 @@ class KaraokeUI:
         self._cover_dirty = True
 
     def _toggle_cover_fullscreen(self):
-        """Switch between the normal layout and the blown-up cover. The layout
+        """Switch between the normal layout and the cover view. The layout
         changes wholesale, so wipe the screen and force a fresh cover redraw."""
         self.cover_fullscreen = not self.cover_fullscreen
         self.stdscr.clear()
@@ -300,10 +303,13 @@ class KaraokeUI:
             return
         if not (bstate & (curses.BUTTON1_PRESSED | curses.BUTTON1_CLICKED)):
             return
-        # Fullscreen cover: any click returns to the normal layout.
-        if self.cover_fullscreen:
-            self._toggle_cover_fullscreen()
-            return
+        # Cover view: a click on the artwork returns to the normal layout;
+        # anywhere else falls through (lyrics and playlist stay clickable).
+        if self.cover_fullscreen and self._cover_rect:
+            cx, cy, cw, ch = self._cover_rect
+            if cx <= mx < cx + cw and cy <= my < cy + ch:
+                self._toggle_cover_fullscreen()
+                return
         # Playlist pane: a click selects a row, a click on the selected row
         # plays it (the pane is tested first — it overlays the lyrics rows).
         if self.playlist_pane and self._queue_x0 is not None and mx >= self._queue_x0:
@@ -798,12 +804,11 @@ class KaraokeUI:
             self.stdscr.refresh()
             return
 
-        # Fullscreen cover takes over the whole screen (click to return).
-        if self.cover_fullscreen:
-            if self.show_cover and self.cover.available() and self.cover_path:
-                self._draw_cover_fullscreen(h, w)
-                return
-            # The track has no usable artwork — drop back to the normal layout.
+        # The cover view only frames the lyrics: the editor and the fetch
+        # panel need the normal layout, and so does a track without artwork.
+        if self.cover_fullscreen and not (
+                self.show_cover and self.cover.available() and self.cover_path
+                and self.edit is None and not self.fetch_panel):
             self.cover_fullscreen = False
             self.stdscr.clear()
             self.cover.hide()
@@ -814,6 +819,10 @@ class KaraokeUI:
         full_w = w
         pane_w = self._pane_width(w) if self.playlist_pane else 0
         w      = full_w - pane_w
+
+        if self.cover_fullscreen:
+            self._draw_cover_view(status, h, w, pane_w)
+            return
 
         elapsed_raw = float(status.get("elapsed", 0))
         duration    = float(status.get("duration") or song.get("time") or 0) or 1
@@ -963,26 +972,29 @@ class KaraokeUI:
         return ("No lyrics — press f to fetch, or drop a .lrc/.txt "
                 "next to the audio file")
 
-    def _draw_lyrics(self, row: int, h: int, w: int, elapsed_adj: float):
+    def _draw_lyrics(self, row: int, h: int, w: int, elapsed_adj: float,
+                     x0: int = 0):
+        """Lyrics between columns `x0` and `w` (x0 > 0 in the cover view)."""
         if not self.lyrics:
             if self.plain:
-                self._draw_plain_lyrics(row, h, w)
+                self._draw_plain_lyrics(row, h, w, x0)
             else:
-                self._addstr(row, 2, self._no_lyrics_msg()[:w - 2],
+                self._addstr(row, x0 + 2, self._no_lyrics_msg()[:w - x0 - 2],
                              curses.color_pair(5))
             return
         avail = max(1, h - row - 2)  # available lines (- help at the bottom)
         self._draw_lyric_lines(self.lyrics, row, avail, h, w, elapsed_adj,
-                               clickable=True)
+                               clickable=True, x0=x0)
 
-    def _draw_plain_lyrics(self, row: int, h: int, w: int):
+    def _draw_plain_lyrics(self, row: int, h: int, w: int, x0: int = 0):
         """Render untimed lyrics as a static, scrollable page.
 
         Nothing can be followed along here, so the whole text is shown plainly
         with a one-line banner making the lack of timings explicit.
         """
-        self._addstr(row, 2,
-                     "Unsynchronized lyrics — ↑↓/jk to scroll, e to time them"[:w - 2],
+        inner = w - x0 - 2
+        self._addstr(row, x0 + 2,
+                     "Unsynchronized lyrics — ↑↓/jk to scroll, e to time them"[:inner],
                      curses.color_pair(5))
         row += 1
         avail = max(1, h - row - 2)
@@ -990,18 +1002,20 @@ class KaraokeUI:
                                        max(0, len(self.plain) - avail)))
         visible = self.plain[self.plain_scroll:self.plain_scroll + avail]
         for i, text in enumerate(visible):
-            self._addstr(row + i, 2, text[:w - 2], curses.color_pair(2))
+            self._addstr(row + i, x0 + 2, text[:inner], curses.color_pair(2))
         # Scroll hint when the text runs past the bottom of the screen.
         if len(self.plain) > avail:
             pos = f" {self.plain_scroll + 1}-{self.plain_scroll + len(visible)}/{len(self.plain)} "
-            self._addstr(row - 1, max(0, w - len(pos)), pos[:w],
+            self._addstr(row - 1, max(x0, w - len(pos)), pos[:w - x0],
                          curses.color_pair(3))
 
     def _draw_lyric_lines(self, lines: list[LyricLine], top_row: int, avail: int,
-                          h: int, w: int, elapsed_adj: float, clickable: bool):
+                          h: int, w: int, elapsed_adj: float, clickable: bool,
+                          x0: int = 0):
         """Render timed lyrics in a scrolling window centered on the active line.
 
-        Shared by the main lyrics view and the fetch-panel preview.
+        Shared by the main lyrics view, the cover view (drawn from column
+        `x0`) and the fetch-panel preview.
         """
         active = -1
         for i in range(len(lines) - 1, -1, -1):
@@ -1015,7 +1029,7 @@ class KaraokeUI:
         active_visual_start: Optional[int] = None
         for idx, lyr in enumerate(lines):
             time_tag = f"[{fmt_time(lyr.time)}] "
-            body_w   = max(1, w - 4 - len(time_tag))
+            body_w   = max(1, w - x0 - 4 - len(time_tag))
             pieces   = textwrap.wrap(
                 lyr.text, width=body_w,
                 break_long_words=True,
@@ -1046,12 +1060,12 @@ class KaraokeUI:
             if abs_i == active:
                 attr = curses.color_pair(1) | curses.A_BOLD
                 if is_first:
-                    self._addstr(lrow, 0, "▶ ", curses.color_pair(4) | curses.A_BOLD)
+                    self._addstr(lrow, x0, "▶ ", curses.color_pair(4) | curses.A_BOLD)
             elif abs_i < active:
                 attr = curses.color_pair(2)  # already sung
             else:
                 attr = curses.color_pair(3)  # upcoming
-            indent_x = 4 if abs_i == active else 2
+            indent_x = x0 + (4 if abs_i == active else 2)
             self._addstr(lrow, indent_x, text[: w - indent_x], attr)
 
     # ── Fetch panel area ──────────────────────────────────────────────────────
@@ -1226,7 +1240,7 @@ class KaraokeUI:
         ("Mouse", (
             ("click lyric","seek to that line"),
             ("click bar",  "seek in the track"),
-            ("click cover","fullscreen artwork"),
+            ("click cover","cover view: artwork + lyrics"),
             ("in editor",  "stamp the clicked line"),
         )),
     )
@@ -1402,24 +1416,55 @@ class KaraokeUI:
         footer = f" {self.queue_sel + 1}/{len(self.queue)}  enter:play  l:close "
         self._addstr(h - 1, left, footer[:inner], curses.color_pair(3))
 
-    def _draw_cover_fullscreen(self, h: int, w: int):
-        """Render the cover as a large centered square filling the terminal,
-        with a one-line hint at the bottom. A click anywhere returns."""
-        # Square in cells: width ≈ 2×height (cells are roughly 1:2). Leave the
-        # last row for the hint.
-        fs_rows = min(h - 1, max(1, w // 2))
-        fs_cols = fs_rows * 2
-        fs_x    = max(0, (w - fs_cols) // 2)
-        fs_y    = max(0, (h - 1 - fs_rows) // 2)
+    def _draw_cover_view(self, status: dict, h: int, w: int, pane_w: int):
+        """The cover view: the artwork as large as it fits on the left, the
+        lyrics in the remaining columns on the right. The header and the
+        now-playing block are hidden. Clicking the artwork returns.
 
-        hint = "click anywhere to return"
-        self._addstr(h - 1, max(0, (w - len(hint)) // 2), hint[:w], curses.color_pair(3))
+        `w` is the width left of the playlist pane (if any). When the terminal
+        is too narrow to keep the lyrics readable, the artwork takes the
+        whole width, centered.
+        """
+        # Square in cells: width ≈ 2×height (cells are roughly 1:2). The cover
+        # spans the full height when the width allows it, otherwise it shrinks
+        # so the lyrics keep their minimum width.
+        cv_rows = min(h, max(0, (w - 2 - self.COVER_VIEW_MIN_LYRICS_W) // 2))
+        split   = cv_rows >= 4
+        if split:
+            cv_cols = cv_rows * 2
+            cv_x    = 0
+            cv_y    = max(0, (h - cv_rows) // 2)
+            x0      = cv_cols + 1          # lyrics start one column past a gap
+
+            elapsed_adj = (float(status.get("elapsed", 0))
+                           + self.offset / 1000.0)
+            self._draw_lyrics(0, h, w, elapsed_adj, x0=x0)
+            help_str = " click cover:back  p:play/pause  h:help "
+            if self.msg and time.time() < self.msg_until:
+                self._addstr(h - 1, x0, f" {self.msg} "[:w - x0],
+                             curses.color_pair(4) | curses.A_BOLD)
+            else:
+                self.msg = None
+                self._addstr(h - 1, x0, help_str[:w - x0], curses.color_pair(3))
+        else:
+            # Too narrow for a side-by-side layout: the artwork alone, with a
+            # one-line hint underneath.
+            cv_rows = min(h - 1, max(1, w // 2))
+            cv_cols = cv_rows * 2
+            cv_x    = max(0, (w - cv_cols) // 2)
+            cv_y    = max(0, (h - 1 - cv_rows) // 2)
+            hint = "click the cover to return"
+            self._addstr(h - 1, max(0, (w - len(hint)) // 2), hint[:w],
+                         curses.color_pair(3))
+
+        if pane_w:
+            self._draw_playlist(w, h, pane_w)
         self.stdscr.refresh()
 
-        self.cover.show(self.cover_path, fs_x, fs_y, fs_cols, fs_rows,
+        self.cover.show(self.cover_path, cv_x, cv_y, cv_cols, cv_rows,
                         force=self._cover_dirty)
         self._cover_dirty = False
-        self._cover_rect = (fs_x, fs_y, fs_cols, fs_rows)
+        self._cover_rect = (cv_x, cv_y, cv_cols, cv_rows)
 
     def _draw_error(self, msg: str):
         h, w = self.stdscr.getmaxyx()

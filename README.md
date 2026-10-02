@@ -161,7 +161,7 @@ configured folders rather than adding to them.
 |--------|--------|
 | Click a lyric line | Seek so that line becomes the current one |
 | Click the progress bar | Seek to that point in the track |
-| Click the album cover | Blow it up fullscreen; click anywhere to return |
+| Click the album cover | Cover view: the artwork fills the left side, the lyrics the right; click the cover again to return |
 | Click a playlist row | Select it; click the selected row again to play it |
 | Click a line in the editor | Stamp it with the current playback position |
 
@@ -180,7 +180,7 @@ Rendering picks the best backend available, degrading gracefully:
 
 `pillow` is required (and is what enables WebP/JPEG decoding); if it is missing the cover is silently skipped. Force a specific backend with `--cover-protocol`.
 
-**Click the cover to enlarge it**: it expands to a centered square filling the terminal; click anywhere to restore the normal layout.
+**Click the cover to switch to the cover view**: the artwork grows as large as the terminal allows on the left, the now-playing block and the status bar are hidden, and the lyrics fill the rest of the screen on the right (still clickable to seek). Click the cover again to restore the normal layout. On a terminal too narrow to keep the lyrics readable, the cover takes the whole screen instead.
 
 ---
 

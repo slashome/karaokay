@@ -16,6 +16,7 @@ from .lrc import (LyricLine, load_lyrics, plain_lines, fmt_stamp,
                   find_lyrics_file, read_lyrics_file, resolve_write_path)
 from .edit import EditSession, session_for
 from .cover import CoverRenderer, find_cover
+from .video import VideoSession, VideoFrames
 from .fetch import (FetchSession, LyricCandidate, simple_search,
                     SYNCEDLYRICS_AVAILABLE, REQUESTS_AVAILABLE)
 from .util import fmt_time, fit, printable
@@ -51,6 +52,12 @@ class KaraokeUI:
         self.cover_path: Optional[str] = None
         self._cover_dirty = False   # force a cover redraw on next frame
         self.cover_fullscreen = False   # cover view: big artwork left, lyrics right
+
+        # Music video in place of the artwork, in the cover view (the `v` key):
+        # the lookup/download, then the frames decoded at the cover's size.
+        self.video_on = False
+        self.video:  Optional[VideoSession] = None
+        self.frames: Optional[VideoFrames]  = None
 
         # Automatic autofetch (background, silent) — runs when no local .lrc.
         self.fetch_lock = threading.Lock()
@@ -232,6 +239,9 @@ class KaraokeUI:
                 self._reset_cover()
             elif key in (ord("f"), ord("F")):
                 self._open_fetch_panel()
+            elif key in (ord("v"), ord("V")):
+                if self.cover_fullscreen:    # the video replaces the big cover
+                    self._toggle_video()
             elif key == curses.KEY_MOUSE:
                 self._handle_mouse()
             elif key == curses.KEY_RESIZE:
@@ -256,6 +266,9 @@ class KaraokeUI:
             self._refresh_queue(status)
             self._draw(status, song)
 
+        # Don't leave a yt-dlp or ffmpeg running behind us.
+        self._stop_video()
+
     def _scroll_plain(self, delta: int):
         """Scroll untimed lyrics; a no-op when the view follows timings."""
         if self.lyrics or not self.plain:
@@ -277,8 +290,83 @@ class KaraokeUI:
         """Switch between the normal layout and the cover view. The layout
         changes wholesale, so wipe the screen and force a fresh cover redraw."""
         self.cover_fullscreen = not self.cover_fullscreen
+        if not self.cover_fullscreen:
+            self._stop_video()
         self.stdscr.clear()
         self._reset_cover()
+
+    # ── Music video (cover view) ──────────────────────────────────────────────
+
+    def _toggle_video(self):
+        """Swap the cover view's artwork for the music video, or back."""
+        if self.video_on:
+            self._stop_video()
+            return
+        if getattr(self.args, "no_video", False):
+            self._toast("music video disabled (no-video)")
+            return
+        self.video_on = True
+        self.video = VideoSession(self.song, self.music_dir)
+        self.video.start()
+
+    def _stop_video(self):
+        """Back to the artwork: abandon the lookup, free the frames."""
+        if self.video:
+            self.video.cancel()
+        if self.frames:
+            self.frames.cancel()
+            self._reset_cover()          # a frame may be on screen
+        self.video_on = False
+        self.video = self.frames = None
+
+    VIDEO_FAILURES = {
+        "not_found": "no music video found for this track",
+        "error":     "music video download failed (network?)",
+    }
+
+    def _video_frame(self, status: dict, cols: int, rows: int
+                     ) -> tuple[Optional[tuple[int, bytes]], str]:
+        """Advance the video pipeline for a cols×rows cover area.
+
+        Returns the frame to show at MPD's elapsed time (None: keep the
+        artwork) and the help-bar label telling where the video stands.
+        Failures end the video with a toast; nothing here may raise.
+        """
+        if not (self.video_on and self.video):
+            return None, "v:video"
+        state, path, missing = self.video.snapshot()
+        if state == "fetching":
+            return None, "v:video (downloading…)"
+        if state != "found" or not path:
+            if state == "unavailable":
+                self._toast(f"music video needs {missing} — not found on $PATH")
+            else:
+                self._toast(self.VIDEO_FAILURES.get(state, "music video failed"))
+            self._stop_video()
+            return None, "v:video"
+
+        # Decoded straight at the cover's size: half-blocks show two pixels
+        # per cell vertically. A new geometry (resize) means a new decode.
+        width, height = cols, rows * 2
+        if (self.frames is None or self.frames.path != path
+                or self.frames.geometry != (width, height)):
+            if self.frames:
+                self.frames.cancel()
+            self.frames = VideoFrames(path, width, height)
+            self.frames.start()
+        fstate, _ = self.frames.snapshot()
+        if fstate in ("error", "unavailable"):
+            self._toast("could not decode the music video")
+            self._stop_video()
+            return None, "v:video"
+
+        # MPD's own position, without the lyrics offset.
+        try:
+            elapsed = float(status.get("elapsed", 0))
+        except (TypeError, ValueError):
+            elapsed = 0.0
+        frame = self.frames.frame_at(elapsed)
+        return frame, ("v:cover" if frame else "v:video (decoding…)")
 
     # ── Playback control ──────────────────────────────────────────────────────
 
@@ -775,6 +863,7 @@ class KaraokeUI:
                 self._load_lrc_for(song)
             return
         self.last_song = song_id
+        self._stop_video()               # the clip belonged to the last track
         self._load_lrc_for(song)
         self.cover_path = find_cover(song, self.music_dir)
         self._cover_dirty = True
@@ -810,6 +899,7 @@ class KaraokeUI:
                 self.show_cover and self.cover.available() and self.cover_path
                 and self.edit is None and not self.fetch_panel):
             self.cover_fullscreen = False
+            self._stop_video()
             self.stdscr.clear()
             self.cover.hide()
 
@@ -1216,6 +1306,7 @@ class KaraokeUI:
             ("H",          "status header"),
             ("i",          "now-playing block"),
             ("c",          "album cover"),
+            ("v",          "cover view: music video / artwork"),
             ("h / ?",      "this help"),
             ("q / Esc",    "quit"),
         )),
@@ -1419,7 +1510,8 @@ class KaraokeUI:
     def _draw_cover_view(self, status: dict, h: int, w: int, pane_w: int):
         """The cover view: the artwork as large as it fits on the left, the
         lyrics in the remaining columns on the right. The header and the
-        now-playing block are hidden. Clicking the artwork returns.
+        now-playing block are hidden. Clicking the artwork returns; `v` swaps
+        it for the music video.
 
         `w` is the width left of the playlist pane (if any). When the terminal
         is too narrow to keep the lyrics readable, the artwork takes the
@@ -1434,18 +1526,6 @@ class KaraokeUI:
             cv_cols = cv_rows * 2
             cv_x    = 0
             cv_y    = max(0, (h - cv_rows) // 2)
-            x0      = cv_cols + 1          # lyrics start one column past a gap
-
-            elapsed_adj = (float(status.get("elapsed", 0))
-                           + self.offset / 1000.0)
-            self._draw_lyrics(0, h, w, elapsed_adj, x0=x0)
-            help_str = " click cover:back  p:play/pause  h:help "
-            if self.msg and time.time() < self.msg_until:
-                self._addstr(h - 1, x0, f" {self.msg} "[:w - x0],
-                             curses.color_pair(4) | curses.A_BOLD)
-            else:
-                self.msg = None
-                self._addstr(h - 1, x0, help_str[:w - x0], curses.color_pair(3))
         else:
             # Too narrow for a side-by-side layout: the artwork alone, with a
             # one-line hint underneath.
@@ -1453,16 +1533,45 @@ class KaraokeUI:
             cv_cols = cv_rows * 2
             cv_x    = max(0, (w - cv_cols) // 2)
             cv_y    = max(0, (h - 1 - cv_rows) // 2)
-            hint = "click the cover to return"
-            self._addstr(h - 1, max(0, (w - len(hint)) // 2), hint[:w],
-                         curses.color_pair(3))
+
+        # The music video, when on and ready, takes the artwork's place.
+        frame, video_label = self._video_frame(status, cv_cols, cv_rows)
+
+        if split:
+            x0      = cv_cols + 1          # lyrics start one column past a gap
+
+            elapsed_adj = (float(status.get("elapsed", 0))
+                           + self.offset / 1000.0)
+            self._draw_lyrics(0, h, w, elapsed_adj, x0=x0)
+            help_str = f" click cover:back  {video_label}  p:play/pause  h:help "
+            if self.msg and time.time() < self.msg_until:
+                self._addstr(h - 1, x0, f" {self.msg} "[:w - x0],
+                             curses.color_pair(4) | curses.A_BOLD)
+            else:
+                self.msg = None
+                self._addstr(h - 1, x0, help_str[:w - x0], curses.color_pair(3))
+        else:
+            if self.msg and time.time() < self.msg_until:
+                hint, attr = self.msg, curses.color_pair(4) | curses.A_BOLD
+            else:
+                self.msg = None
+                hint = f"click the cover to return  {video_label}"
+                attr = curses.color_pair(3)
+            self._addstr(h - 1, max(0, (w - len(hint)) // 2), hint[:w], attr)
 
         if pane_w:
             self._draw_playlist(w, h, pane_w)
         self.stdscr.refresh()
 
-        self.cover.show(self.cover_path, cv_x, cv_y, cv_cols, cv_rows,
-                        force=self._cover_dirty)
+        if frame and self.frames:
+            idx, data = frame
+            self.cover.show_frame(data, self.frames.geometry,
+                                  (self.frames.path, self.frames.geometry, idx),
+                                  cv_x, cv_y, cv_cols, cv_rows,
+                                  force=self._cover_dirty)
+        else:
+            self.cover.show(self.cover_path, cv_x, cv_y, cv_cols, cv_rows,
+                            force=self._cover_dirty)
         self._cover_dirty = False
         self._cover_rect = (cv_x, cv_y, cv_cols, cv_rows)
 

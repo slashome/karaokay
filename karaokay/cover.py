@@ -5,20 +5,27 @@ sequences in a rectangle that curses is told to leave untouched. A best-effort
 cascade picks the nicest backend the terminal supports:
 
   kitty   — Kitty graphics protocol (Kitty, Ghostty, WezTerm). Overlay image,
-            transmitted once per track.
+            transmitted once per track; a video frame replaces the previous
+            one in place under a fixed image id.
   iterm2  — iTerm2 inline images (iTerm2, WezTerm). Cell-anchored, drawn once
-            per track and kept alive by curses' blank-cell persistence.
+            per track and kept alive by curses' blank-cell persistence; video
+            frames are re-emitted at a reduced rate.
   blocks  — truecolor half-block glyphs (▀). Works in any 24-bit terminal;
             repainted every frame so it survives curses redraws.
   blocks256 — same half-block trick quantized to the xterm-256 palette, for
             terminals without 24-bit color (e.g. Apple Terminal).
 
 All backends require Pillow (decoding + resizing, mandatory for WebP/JPEG).
+
+`show` paints an image file (the album cover); `show_frame` paints a raw rgb24
+frame held in memory (a music video frame, see video.py).
 """
 
 import io
 import os
 import sys
+import time
+import zlib
 import base64
 from pathlib import Path
 from typing import Optional
@@ -86,12 +93,18 @@ def detect_cover_backend(override: str) -> Optional[str]:
 
 class CoverRenderer:
     KITTY_CHUNK = 4096   # base64 chars per kitty transmission chunk
+    KITTY_VIDEO_ID = 7247   # fixed image id: each frame replaces the last
+    # iTerm2 re-sends a whole PNG per frame; half the video rate keeps the
+    # stream around 4 images/s.
+    ITERM2_FRAME_INTERVAL = 0.25
 
     def __init__(self, override: str = "auto"):
         self.backend  = detect_cover_backend(override)
         self._sig      = None   # (path, x, y, cols, rows) currently displayed
         self._shown    = False
         self._blocks   = None   # cached escape string for the blocks backend
+        self._frame    = None   # key of the video frame currently displayed
+        self._frame_at = 0.0    # when it was emitted (iterm2 throttling)
 
     def available(self) -> bool:
         return self.backend is not None and PIL_AVAILABLE
@@ -124,7 +137,8 @@ class CoverRenderer:
         try:
             if self.backend in ("blocks", "blocks256"):
                 if changed or self._blocks is None:
-                    self._blocks = self._render_blocks(path, x, y, cols, rows)
+                    self._blocks = self._render_blocks(
+                        Image.open(path), x, y, cols, rows)
                     self._sig    = sig
                 if self._blocks:
                     self._emit(self._blocks)   # repaint every frame
@@ -132,15 +146,55 @@ class CoverRenderer:
             elif self.backend == "kitty":
                 if changed:
                     self._clear_kitty()
-                    self._emit_kitty(path, x, y, cols, rows)
+                    self._emit_kitty(Image.open(path), x, y, cols, rows)
                     self._sig, self._shown = sig, True
             elif self.backend == "iterm2":
                 if changed:
-                    self._emit_iterm2(path, x, y, cols, rows)
+                    self._emit_iterm2(Image.open(path), x, y, cols, rows)
                     self._sig, self._shown = sig, True
         except Exception:
             # A broken/unreadable image must never crash the UI.
             self._sig = sig   # don't retry this geometry every frame
+            self._blocks = ""
+
+    def show_frame(self, frame: bytes, size: tuple[int, int], key,
+                   x: int, y: int, cols: int, rows: int, force: bool = False):
+        """Display a raw rgb24 `frame` of `size` (w, h) pixels at cell (x, y)
+        spanning cols×rows. `key` identifies the frame: an unchanged key is
+        not sent again. Must be called AFTER curses' refresh(), like show()."""
+        if not self.available():
+            return
+        sig       = ("video", x, y, cols, rows)
+        changed   = force or sig != self._sig
+        new_frame = changed or key != self._frame
+        try:
+            if self.backend in ("blocks", "blocks256"):
+                if new_frame or self._blocks is None:
+                    img = Image.frombytes("RGB", size, frame)
+                    self._blocks = self._render_blocks(img, x, y, cols, rows)
+                    self._sig, self._frame = sig, key
+                if self._blocks:
+                    self._emit(self._blocks)   # repaint every frame
+                    self._shown = True
+            elif self.backend == "kitty":
+                if changed:
+                    self._clear_kitty()        # the cover, or a stale geometry
+                if new_frame:
+                    self._emit_kitty_frame(frame, size, x, y, cols, rows)
+                    self._sig, self._frame, self._shown = sig, key, True
+            elif self.backend == "iterm2":
+                # Degraded: a full PNG per image is heavy for iTerm2, so frames
+                # are throttled (the playback position still picks which one).
+                now = time.monotonic()
+                if changed or (new_frame and now - self._frame_at
+                               >= self.ITERM2_FRAME_INTERVAL):
+                    img = Image.frombytes("RGB", size, frame)
+                    self._emit_iterm2(img, x, y, cols, rows)
+                    self._sig, self._frame, self._shown = sig, key, True
+                    self._frame_at = now
+        except Exception:
+            # A bad frame must never crash the UI.
+            self._sig, self._frame = sig, key
             self._blocks = ""
 
     def hide(self):
@@ -156,11 +210,13 @@ class CoverRenderer:
         self._shown = False
         self._sig    = None
         self._blocks = None
+        self._frame  = None
 
     def invalidate(self):
         """Force a full redraw on the next show() (after resize / toggle)."""
         self._sig    = None
         self._blocks = None
+        self._frame  = None
 
     # ── Backends ────────────────────────────────────────────────────────────
 
@@ -179,11 +235,11 @@ class CoverRenderer:
         bi = b * 5 // 255
         return 16 + 36 * ri + 6 * gi + bi
 
-    def _render_blocks(self, path: str, x: int, y: int,
+    def _render_blocks(self, img: "Image.Image", x: int, y: int,
                        cols: int, rows: int) -> str:
         # One character cell shows two vertical pixels via the upper half block:
         # foreground = top pixel, background = bottom pixel.
-        img    = Image.open(path).convert("RGB").resize((cols, rows * 2))
+        img    = img.convert("RGB").resize((cols, rows * 2))
         px     = img.load()
         is_256 = self.backend == "blocks256"
         out    = []
@@ -204,31 +260,51 @@ class CoverRenderer:
             out.append("".join(line))
         return "".join(out)
 
-    def _png_bytes(self, path: str) -> bytes:
-        img = Image.open(path).convert("RGBA")
+    def _png_bytes(self, img: "Image.Image") -> bytes:
+        img = img.convert("RGBA")
         img.thumbnail((512, 512))   # cap payload size
         buf = io.BytesIO()
         img.save(buf, "PNG")
         return buf.getvalue()
 
-    def _emit_kitty(self, path: str, x: int, y: int, cols: int, rows: int):
-        b64 = base64.b64encode(self._png_bytes(path)).decode("ascii")
+    def _emit_kitty(self, img: "Image.Image", x: int, y: int,
+                    cols: int, rows: int):
+        self._kitty_transmit(self._png_bytes(img), "f=100", x, y, cols, rows)
+
+    def _emit_kitty_frame(self, frame: bytes, size: tuple[int, int],
+                          x: int, y: int, cols: int, rows: int):
+        # Raw RGB (f=24), zlib-compressed: no PNG encoding per frame. The fixed
+        # id makes kitty replace the previous frame in place, so nothing is
+        # cleared between frames; q=2 silences the reply kitty would otherwise
+        # send to an id'd image — on stdin, where curses would read it as keys.
+        w, h = size
+        self._kitty_transmit(
+            zlib.compress(frame, 1),
+            f"f=24,s={w},v={h},o=z,i={self.KITTY_VIDEO_ID},p=1",
+            x, y, cols, rows, quiet=True)
+
+    def _kitty_transmit(self, data: bytes, fmt: str, x: int, y: int,
+                        cols: int, rows: int, quiet: bool = False):
+        b64 = base64.b64encode(data).decode("ascii")
         self._emit(self._cup(x, y))
         chunks = [b64[i:i + self.KITTY_CHUNK]
                   for i in range(0, len(b64), self.KITTY_CHUNK)] or [""]
         for i, chunk in enumerate(chunks):
             last = i == len(chunks) - 1
             if i == 0:
-                ctrl = f"a=T,f=100,c={cols},r={rows},m={0 if last else 1}"
+                ctrl = f"a=T,{fmt},c={cols},r={rows},m={0 if last else 1}"
             else:
                 ctrl = f"m={0 if last else 1}"
+            if quiet:
+                ctrl += ",q=2"              # every chunk may carry it
             self._emit(f"\x1b_G{ctrl};{chunk}\x1b\\")
 
     def _clear_kitty(self):
         self._emit("\x1b_Ga=d\x1b\\")   # delete all images
 
-    def _emit_iterm2(self, path: str, x: int, y: int, cols: int, rows: int):
-        b64 = base64.b64encode(self._png_bytes(path)).decode("ascii")
+    def _emit_iterm2(self, img: "Image.Image", x: int, y: int,
+                     cols: int, rows: int):
+        b64 = base64.b64encode(self._png_bytes(img)).decode("ascii")
         self._emit(self._cup(x, y))
         self._emit(
             f"\x1b]1337;File=inline=1;width={cols};height={rows};"

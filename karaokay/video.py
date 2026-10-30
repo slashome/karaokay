@@ -1,4 +1,4 @@
-"""Music video lookup and download.
+"""Music video lookup, download and decoding.
 
 The cover view can swap the artwork for the track's music video (the `v` key).
 `VideoSession` resolves the clip in a background thread, cheapest source
@@ -10,6 +10,9 @@ first:
             smallest format available: the sound always comes from MPD. Of
             the results, the closest in length to the track wins, still
             covers (square pictures) excepted.
+
+`VideoFrames` then decodes the clip with `ffmpeg` into small raw frames, so the
+frame matching MPD's elapsed time is a list lookup.
 
 `yt-dlp` and `ffmpeg` are optional binaries looked up on $PATH, never Python
 dependencies: without them the session reports `unavailable` and the cover
@@ -286,3 +289,124 @@ class VideoSession:
                 failed = True
         self._set("error" if failed else "not_found")
 
+
+# ── Decoding ──────────────────────────────────────────────────────────────────
+
+# The UI loop ticks every 100 ms, so 10 frames/s is the ceiling; 8 keeps a
+# 4-minute clip at 80×80 px around 37 MB.
+VIDEO_FPS = 8
+
+
+class VideoFrames:
+    """Decodes a clip into raw rgb24 frames of `width`×`height` pixels, at
+    `fps` frames per second, in a background thread.
+
+    `ffmpeg` scales the clip straight to the cover's size (letterboxed, black
+    bars) and drops the audio, so the frames are ready to paint. They are kept
+    in memory, frame n covering [n/fps, (n+1)/fps): the frame for a playback
+    position is a list lookup. States: decoding / ready / error / unavailable.
+    """
+
+    def __init__(self, path: str, width: int, height: int, fps: int = VIDEO_FPS):
+        self.path   = path
+        self.width  = max(1, width)
+        self.height = max(1, height)
+        self.fps    = fps
+        self.lock   = threading.Lock()
+        self.frames: list[bytes] = []
+        self.state  = "decoding"
+        self._cancelled = False
+        self._proc:   Optional[subprocess.Popen] = None
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def geometry(self) -> tuple[int, int]:
+        return self.width, self.height
+
+    # ── Public API ───────────────────────────────────────────────────────────
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def snapshot(self) -> tuple[str, int]:
+        """(state, number of frames decoded so far)."""
+        with self.lock:
+            return self.state, len(self.frames)
+
+    def frame_at(self, elapsed: float) -> Optional[tuple[int, bytes]]:
+        """(index, rgb24 bytes) of the frame shown `elapsed` seconds into the
+        track, or None while that frame is not decoded yet. Past the end of a
+        fully decoded clip, the last frame stays."""
+        idx = int(max(0.0, elapsed) * self.fps)
+        with self.lock:
+            if idx < len(self.frames):
+                return idx, self.frames[idx]
+            if self.state == "ready" and self.frames:
+                return len(self.frames) - 1, self.frames[-1]
+        return None
+
+    def cancel(self):
+        """Stop decoding and drop the frames."""
+        with self.lock:
+            self._cancelled = True
+            self.frames = []
+            proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+    def wait(self, timeout: Optional[float] = None):
+        if self._thread:
+            self._thread.join(timeout)
+
+    # ── Worker ────────────────────────────────────────────────────────────────
+
+    def _set_state(self, state: str):
+        with self.lock:
+            if not self._cancelled:
+                self.state = state
+
+    def _run(self):
+        try:
+            self._decode()
+        except Exception:
+            self._set_state("error")
+
+    def _decode(self):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self._set_state("unavailable")
+            return
+        w, h = self.width, self.height
+        vf = (f"fps={self.fps},"
+              f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
+        with self.lock:
+            if self._cancelled:
+                return
+            self._proc = subprocess.Popen(
+                [ffmpeg, "-nostdin", "-v", "error", "-i", self.path,
+                 "-an", "-sn", "-dn", "-vf", vf,
+                 "-pix_fmt", "rgb24", "-f", "rawvideo", "pipe:1"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+            proc = self._proc
+
+        size = w * h * 3
+        while True:
+            frame = proc.stdout.read(size)
+            if len(frame) < size:
+                break                    # end of stream (or a torn last frame)
+            with self.lock:
+                if self._cancelled:
+                    break
+                self.frames.append(frame)
+        proc.stdout.close()
+        code = proc.wait()
+        with self.lock:
+            if self._cancelled:
+                return
+            self.state = "ready" if code == 0 and self.frames else "error"

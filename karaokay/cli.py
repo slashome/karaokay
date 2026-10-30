@@ -64,6 +64,9 @@ def main():
                    help="Disable automatic lyrics retrieval via syncedlyrics")
     p.add_argument("--no-cover", action="store_true",
                    help="Disable album cover display (requires pillow)")
+    p.add_argument("--no-video", action="store_true",
+                   help="Disable the music video of the cover view (`v`; "
+                        "requires yt-dlp and ffmpeg)")
     p.add_argument("--cover-protocol", default="auto",
                    choices=["auto", "kitty", "iterm2", "blocks", "blocks256", "none"],
                    help="Cover rendering backend (default: auto-detect)")

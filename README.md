@@ -29,6 +29,7 @@ A minimalist curses-based karaoke client that follows whatever MPD is playing an
 - Interactive lyrics picker (`f`): list candidates from several sites (LrcLib, Musixmatch, NetEase, Megalobiz, Genius), preview one against the running track, and save the chosen `.lrc` into the album folder
 - Timing editor (`e`): retime a line by clicking it while the track plays, or turn a plain `.txt` into a synced `.lrc` line by line
 - Optional album cover next to the player — uses the best backend your terminal supports (Kitty graphics, iTerm2 inline images, or truecolor half-blocks everywhere else)
+- Music video on demand (`v` in the cover view): a clip next to the audio file, or found on YouTube and downloaded without sound, played in place of the artwork in step with MPD
 - Reconnects automatically if MPD goes away
 - Clean color-coded UI (past / current / upcoming lines)
 
@@ -54,6 +55,7 @@ Requirements:
 - *(Optional)* [`syncedlyrics`](https://pypi.org/project/syncedlyrics/) for online lyrics fetch
 - *(Optional)* [`pillow`](https://pypi.org/project/pillow/) for album cover display (required for WebP/JPEG decoding)
 - *(Optional)* [`pyyaml`](https://pypi.org/project/PyYAML/) for the config file — without it, the flat `key: value` form documented below is still read
+- *(Optional)* the [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and [`ffmpeg`](https://ffmpeg.org/) binaries on your `$PATH` for the [music video](#music-video-v) — programs, not Python packages (`brew install yt-dlp ffmpeg`)
 - *(Windows only)* `windows-curses`
 
 ```bash
@@ -99,6 +101,7 @@ karaokay --no-autofetch
 | `--offset` | `0` | Initial sync offset in ms |
 | `--no-autofetch` | off | Disables `syncedlyrics` online fetch |
 | `--no-cover` | off | Disables album cover display |
+| `--no-video` | off | Disables the music video of the cover view (`v`) |
 | `--cover-protocol` | `auto` | Cover backend: `auto`, `kitty`, `iterm2`, `blocks`, `blocks256`, `none` |
 | `--playlist-width` | `50` | Width of the `l` playlist pane, in % of the screen (20–80) |
 
@@ -125,6 +128,7 @@ offset: 0               # ms
 playlist-width: 40      # % of the screen taken by the `l` pane
 cover-protocol: kitty
 no-cover: false
+no-video: false
 no-autofetch: false
 ```
 
@@ -152,6 +156,7 @@ configured folders rather than adding to them.
 | `H` | Toggle the status header |
 | `i` | Toggle the now-playing block |
 | `c` | Toggle the album cover |
+| `v` | In the cover view: play the music video in place of the artwork, or back |
 
 ---
 
@@ -181,6 +186,49 @@ Rendering picks the best backend available, degrading gracefully:
 `pillow` is required (and is what enables WebP/JPEG decoding); if it is missing the cover is silently skipped. Force a specific backend with `--cover-protocol`.
 
 **Click the cover to switch to the cover view**: the artwork grows as large as the terminal allows on the left, the now-playing block and the status bar are hidden, and the lyrics fill the rest of the screen on the right (still clickable to seek). Click the cover again to restore the normal layout. On a terminal too narrow to keep the lyrics readable, the cover takes the whole screen instead.
+
+---
+
+## Music video (`v`)
+
+In the cover view, press **`v`** to play the track's music video in place of
+the artwork; press it again to bring the artwork back. Nothing is downloaded
+until you ask.
+
+Requires the [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) and
+[`ffmpeg`](https://ffmpeg.org/) programs on your `$PATH` (`brew install yt-dlp
+ffmpeg`). Without them `v` says which one is missing in the help bar and the
+artwork stays; with a local clip, `ffmpeg` alone is enough.
+
+The clip is looked for in this order:
+
+1. **Next to the audio file** — same name as the track (`01 Song.mp4` for
+   `01 Song.flac`), or `video.mp4` in the album folder; `.mp4`, `.webm` and
+   `.mkv`, any case. Used as is, without network.
+2. **The cache** — `~/.cache/karaokay/videos/` (or
+   `$XDG_CACHE_HOME/karaokay/videos/`): a clip downloaded once is never asked
+   for again. The cache has no size limit; delete files there to reclaim room.
+3. **YouTube** — a `yt-dlp` search for *artist title official video*; of the
+   first five results, the one closest in length to the track wins — except a
+   square picture, which is a still album cover laid over the audio rather than
+   a clip, so the next result is tried. It is downloaded **without its audio
+   track**, in the smallest format available — the sound always comes from MPD.
+
+The download runs in the background: the artwork stays on screen meanwhile,
+and the help bar reads *downloading…*, then *decoding…*. The frame shown
+follows MPD's playback position: pausing freezes the picture, a seek (clicking
+a lyric line) moves it, and past the end of the clip its last frame stays.
+Leaving the cover view or changing track brings the artwork back.
+
+The video is drawn by the same backends as the cover, at the cover's size:
+Kitty and the half-block backends at ~8 frames per second, iTerm2 at a reduced
+rate (each frame is a whole inline image there).
+
+Turn the feature off with `--no-video` (or `no-video: true` in the config).
+
+**Known limitation:** an official clip is rarely cut like the album track — a
+spoken intro, a radio edit, a shorter ending — so on some tracks the picture
+runs visibly ahead of or behind the music. There is no per-track video offset.
 
 ---
 

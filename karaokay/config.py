@@ -14,6 +14,7 @@ Keys mirror the long flag names with the leading dashes dropped; ``-`` and
     offset: 0
     playlist-width: 50
     no-cover: false
+    no-video: false
     cover-protocol: kitty
 
 PyYAML is used when installed; otherwise the flat subset above is read by a
@@ -44,6 +45,7 @@ SCHEMA: dict[str, type] = {
     "offset":          int,
     "no_autofetch":    bool,
     "no_cover":        bool,
+    "no_video":        bool,
     "cover_protocol":  str,
     "playlist_width":  int,
 }
